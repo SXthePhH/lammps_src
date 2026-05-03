@@ -66,8 +66,8 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
 
   nh_temp_flag = 0;
   nh_press_flag = 0;
-  big_mass_flag = 1;
-  big_omega_update_flag = 1;
+  big_mass_flag = 0;
+  big_omega_update_flag = 0;
 
   restart_global = 1;
   dynamic_group_allow = 1;
