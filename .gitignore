@@ -1,0 +1,12 @@
+*.o
+*.lo
+*.so
+*.a
+*.d
+*.mod
+lmp*
+.depend
+Obj_*/
+Makefile.package.settings
+Makefile.package
+Makefile.auto
