@@ -31,6 +31,11 @@ class FixShake : public Fix {
  public:
   FixShake(class LAMMPS *, int, char **);
   ~FixShake() override;
+
+  // extra protected constructor for wrapper classes (e.g. fix nh new + rattle)
+  // Arg parsing skipped - the derived class is expected to do its own parsing
+ protected:
+  FixShake(class LAMMPS *, int, char **, int);
   int setmask() override;
   void init() override;
   void setup(int) override;
@@ -109,6 +114,8 @@ class FixShake : public Fix {
   int **shake_type;       // bondtype of each bond in cluster
                           // for angle cluster, 3rd value
                           //   is angletype
+  double **vp;            // unconstrained velocities (RATTLE)
+  int comm_mode;          // mode for communication pack/unpack
   double **xshake;        // unconstrained atom coords
   int *nshake;            // count
 
@@ -145,6 +152,12 @@ class FixShake : public Fix {
   void shake4(int);
   void shake3angle(int);
   double bond_force(int, int, double);
+  virtual void vrattle2(int m);
+  virtual void vrattle3(int m);
+  virtual void vrattle4(int m);
+  virtual void vrattle3angle(int m);
+  void solve3x3exactly(const double a[][3], const double c[], double l[]);
+  void solve2x2exactly(const double a[][2], const double c[], double l[]);
   virtual void stats();
   int bondtype_findset(int, tagint, tagint, int);
   int angletype_findset(int, tagint, tagint, int);

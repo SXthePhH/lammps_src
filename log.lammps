@@ -1,0 +1,9 @@
+LAMMPS (11 Feb 2026)
+OMP_NUM_THREADS environment is not set. Defaulting to 1 thread.
+  using 1 OpenMP thread(s) per MPI task
+units real
+atom_style full
+read_data ../data.tip3p
+ERROR: Cannot open file ../data.tip3p: No such file or directory (src/read_data.cpp:380)
+Last input line: read_data ../data.tip3p 
+                           ^^^^^^^^^^^^^

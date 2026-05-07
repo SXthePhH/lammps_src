@@ -16,7 +16,7 @@
    Contributing authors: Mark Stevens (SNL), Aidan Thompson (SNL)
 ------------------------------------------------------------------------- */
 
-#include "fix_nh.h"
+#include "fix_nh_con.h"
 
 #include "atom.h"
 #include "comm.h"
@@ -33,6 +33,8 @@
 #include "neighbor.h"
 #include "respa.h"
 #include "update.h"
+#include "random_mars.h"
+#include "output.h"
 
 #include <cmath>
 #include <cstring>
@@ -44,6 +46,8 @@ static constexpr double DELTAFLIP = 0.1;
 static constexpr double TILTMAX = 1.5;
 static constexpr double EPSILON = 1.0e-6;
 
+enum{SIDE, MIDDLE};
+
 enum{NONE,XYZ,XY,YZ,XZ};
 enum{ISO,ANISO,TRICLINIC};
 enum{NOBIAS,BIAS};
@@ -52,12 +56,18 @@ enum{NOBIAS,BIAS};
    NVT,NPH,NPT integrators for improved Nose-Hoover equations of motion
  ---------------------------------------------------------------------- */
 
-FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
-    Fix(lmp, narg, arg), id_dilate(nullptr), irregular(nullptr), step_respa(nullptr), id_temp(nullptr),
+FixNHCon::FixNHCon(LAMMPS *lmp, int narg, char **arg) :
+    FixRattle(lmp, narg, arg, 0), id_dilate(nullptr), irregular(nullptr), id_temp(nullptr),
     id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
-    etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr)
+  etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr),
+  v_storage(nullptr), v_backup(nullptr), v_stored(0), nmax(0)
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
+
+  nh_temp_flag = 0;
+  nh_press_flag = 0;
+  big_mass_flag = 0;
+  big_omega_update_flag = 0;
 
   restart_global = 1;
   dynamic_group_allow = 1;
@@ -96,6 +106,14 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
 
   dimension = domain->dimension;
 
+  seed = 12345678;
+  damp_p = damp_t = 0.0;
+  gamma_t = gamma_p = 0.0;
+  omega_mass_corr = 0.0;
+  tau_baro = 0.0;
+  integrator = SIDE;
+  zero_flag = 0;
+
   scaleyz = scalexz = scalexy = 0;
   if (domain->yperiodic && domain->xy != 0.0) scalexy = 1;
   if (domain->zperiodic && dimension == 3) {
@@ -127,32 +145,110 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
   int iarg = 3;
 
   while (iarg < narg) {
-    if (strcmp(arg[iarg],"temp") == 0) {
+    if (strcmp(arg[iarg],"thermostat") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} thermostat", style), error);
+      if (strcmp(arg[iarg+1],"nh") == 0) nh_temp_flag = 1;
+      else if (strcmp(arg[iarg+1],"langevin") == 0) nh_temp_flag = 0;
+      else error->all(FLERR, "Illegal fix {} thermostat option: {}", style, arg[iarg+1]);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"big_mass") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} big_mass", style), error);
+      if (strcmp(arg[iarg+1],"yes") == 0 || strcmp(arg[iarg+1],"on") == 0 || strcmp(arg[iarg+1],"1") == 0)
+        big_mass_flag = 1;
+      else if (strcmp(arg[iarg+1],"no") == 0 || strcmp(arg[iarg+1],"off") == 0 || strcmp(arg[iarg+1],"0") == 0)
+        big_mass_flag = 0;
+      else error->all(FLERR, "Illegal fix {} big_mass option: {}", style, arg[iarg+1]);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"big_update") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} big_update", style), error);
+      if (strcmp(arg[iarg+1],"yes") == 0 || strcmp(arg[iarg+1],"on") == 0 || strcmp(arg[iarg+1],"1") == 0)
+        big_omega_update_flag = 1;
+      else if (strcmp(arg[iarg+1],"no") == 0 || strcmp(arg[iarg+1],"off") == 0 || strcmp(arg[iarg+1],"0") == 0)
+        big_omega_update_flag = 0;
+      else error->all(FLERR, "Illegal fix {} big_update option: {}", style, arg[iarg+1]);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"barostat") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} barostat", style), error);
+      if (strcmp(arg[iarg+1],"nh") == 0) nh_press_flag = 1;
+      else if (strcmp(arg[iarg+1],"langevin") == 0) nh_press_flag = 0;
+      else error->all(FLERR, "Illegal fix {} barostat option: {}", style, arg[iarg+1]);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"temp") == 0) {
       if (iarg+4 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} temp", style), error);
       tstat_flag = 1;
       t_start = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       t_target = t_start;
       t_stop = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       t_period = utils::numeric(FLERR,arg[iarg+3],false,lmp);
+      damp_t = t_period;
       if (t_start <= 0.0 || t_stop <= 0.0)
         error->all(FLERR, "Target temperature for fix {} cannot be 0.0", style);
       iarg += 4;
 
+    // ---- SHAKE/RATTLE constraint keywords (merged from fix rattle) ----
+
+    } else if (strcmp(arg[iarg],"shake_tol") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} shake_tol", style), error);
+      tolerance = utils::numeric(FLERR, arg[iarg+1], false, lmp);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"shake_iter") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} shake_iter", style), error);
+      max_iter = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg],"shake_bond") == 0) {
+      if (iarg+3 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} shake_bond", style), error);
+      int btype = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      double bdist = utils::numeric(FLERR, arg[iarg+2], false, lmp);
+      if (btype < 1 || btype > atom->nbondtypes)
+        error->all(FLERR, "Invalid bond type {} for shake_bond", btype);
+      bond_flag[btype] = 1;
+      bond_distance[btype] = bdist;
+      iarg += 3;
+
+    } else if (strcmp(arg[iarg],"shake_angle") == 0) {
+      if (iarg+3 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} shake_angle", style), error);
+      int atype = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      double adist = utils::numeric(FLERR, arg[iarg+2], false, lmp);
+      if (atype < 1 || atype > atom->nangletypes)
+        error->all(FLERR, "Invalid angle type {} for shake_angle", atype);
+      angle_flag[atype] = 1;
+      angle_distance[atype] = adist;
+      iarg += 3;
+
+    // ---- end SHAKE/RATTLE constraint keywords ----
+
     } else if (strcmp(arg[iarg],"iso") == 0) {
-      if (iarg+4 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} iso", style), error);
+      if (iarg+6 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} iso", style), error);
       pcouple = XYZ;
       p_start[0] = p_start[1] = p_start[2] = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       p_stop[0] = p_stop[1] = p_stop[2] = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       p_period[0] = p_period[1] = p_period[2] =
         utils::numeric(FLERR,arg[iarg+3],false,lmp);
+      damp_p = p_period[0];
       p_flag[0] = p_flag[1] = p_flag[2] = 1;
       if (dimension == 2) {
         p_start[2] = p_stop[2] = p_period[2] = 0.0;
         p_flag[2] = 0;
       }
-      iarg += 4;
+      tau_baro = utils::numeric(FLERR, arg[iarg+4], false, lmp);
+      omega_mass_corr = utils::numeric(FLERR, arg[iarg+5], false, lmp);
+      iarg += 6;
     } else if (strcmp(arg[iarg],"aniso") == 0) {
-      if (iarg+4 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} aniso", style), error);
+      if (iarg+6 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} aniso", style), error);
       pcouple = NONE;
       p_start[0] = p_start[1] = p_start[2] = utils::numeric(FLERR,arg[iarg+1],false,lmp);
       p_stop[0] = p_stop[1] = p_stop[2] = utils::numeric(FLERR,arg[iarg+2],false,lmp);
@@ -163,9 +259,11 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
         p_start[2] = p_stop[2] = p_period[2] = 0.0;
         p_flag[2] = 0;
       }
-      iarg += 4;
+      tau_baro = utils::numeric(FLERR, arg[iarg+4], false, lmp);
+      omega_mass_corr = utils::numeric(FLERR, arg[iarg+5], false, lmp);
+      iarg += 6;
     } else if (strcmp(arg[iarg],"tri") == 0) {
-      if (iarg+4 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} tri", style), error);
+      if (iarg+6 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} tri", style), error);
       pcouple = NONE;
       scalexy = scalexz = scaleyz = 0;
       p_start[0] = p_start[1] = p_start[2] = utils::numeric(FLERR,arg[iarg+1],false,lmp);
@@ -178,6 +276,7 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
       p_period[3] = p_period[4] = p_period[5] =
         utils::numeric(FLERR,arg[iarg+3],false,lmp);
       p_flag[3] = p_flag[4] = p_flag[5] = 1;
+      damp_p = p_period[0];
       if (dimension == 2) {
         p_start[2] = p_stop[2] = p_period[2] = 0.0;
         p_flag[2] = 0;
@@ -186,7 +285,9 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
         p_start[4] = p_stop[4] = p_period[4] = 0.0;
         p_flag[4] = 0;
       }
-      iarg += 4;
+      tau_baro = utils::numeric(FLERR, arg[iarg+4], false, lmp);
+      omega_mass_corr = utils::numeric(FLERR, arg[iarg+5], false, lmp);
+      iarg += 6;
     } else if (strcmp(arg[iarg],"x") == 0) {
       if (iarg+4 > narg) utils::missing_cmd_args(FLERR, fmt::format("fix {} x", style), error);
       p_start[0] = utils::numeric(FLERR,arg[iarg+1],false,lmp);
@@ -366,9 +467,26 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
     } else if (strcmp(arg[iarg], "kick") == 0) {
       iarg += 2;
     } else if (strcmp(arg[iarg], "integrator") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} integrator", style), error);
+      if (strcmp(arg[iarg+1], "side") == 0) integrator = SIDE;
+      else if (strcmp(arg[iarg+1], "middle") == 0) integrator = MIDDLE;
+      else error->all(FLERR, "Illegal fix {} integrator option: {}", style, arg[iarg+1]);
       iarg += 2;
 
-    } else error->all(FLERR,"Unknown fix {} keyword: {}", style, arg[iarg]);
+    } else if (strcmp(arg[iarg], "seed") == 0) {
+      if (iarg+1 >= narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} seed", style), error);
+      seed = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg], "zero") == 0) {
+      if (iarg+2 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} zero", style), error);
+      zero_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+      iarg += 2;
+
+    }else error->all(FLERR,"Unknown fix {} keyword: {}", style, arg[iarg]);
   }
 
   // error checks
@@ -577,20 +695,39 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
   if (pre_exchange_flag) irregular = new Irregular(lmp);
   else irregular = nullptr;
 
+  // create default temperature and pressure computes (like FixNPTNEW)
+  if (tstat_flag || pstat_flag) {
+    id_temp = utils::strdup(std::string(id) + "_temp");
+    modify->add_compute(fmt::format("{} all temp", id_temp));
+    tcomputeflag = 1;
+  }
+  if (pstat_flag) {
+    id_press = utils::strdup(std::string(id) + "_press");
+    modify->add_compute(fmt::format("{} all pressure {}", id_press, id_temp));
+    pcomputeflag = 1;
+  }
+
   // initialize vol0,t0 to zero to signal uninitialized
   // values then assigned in init(), if necessary
 
   vol0 = t0 = 0.0;
+
+  gamma_t = 1.0 / damp_t;
+  gamma_p = 1.0 / damp_p;
+  random = new RanMars(lmp,seed);
 }
 
 /* ---------------------------------------------------------------------- */
 
-FixNH::~FixNH()
+FixNHCon::~FixNHCon()
 {
+  delete random;
   if (copymode) return;
 
   delete[] id_dilate;
   delete irregular;
+  memory->destroy(v_storage);
+  memory->destroy(v_backup);
 
   // delete temperature and pressure if fix created them
 
@@ -618,7 +755,7 @@ FixNH::~FixNH()
 
 /* ---------------------------------------------------------------------- */
 
-int FixNH::setmask()
+int FixNHCon::setmask()
 {
   int mask = 0;
   mask |= INITIAL_INTEGRATE;
@@ -626,14 +763,31 @@ int FixNH::setmask()
   mask |= INITIAL_INTEGRATE_RESPA;
   mask |= FINAL_INTEGRATE_RESPA;
   mask |= PRE_FORCE_RESPA;
+  mask |= PRE_NEIGHBOR;
+  if (integrator == MIDDLE) mask |= END_OF_STEP;
   if (pre_exchange_flag) mask |= PRE_EXCHANGE;
   return mask;
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::init()
+void FixNHCon::init()
 {
+  // Re-allocate atom-based arrays (vp, shake_flag) at the correct nmax,
+  // in case the constructor ran before atoms were fully set up.
+  FixRattle::grow_arrays(atom->nmax);
+
+  // Initialize SHAKE/RATTLE constraint infrastructure first
+  // This calls FixShake::init() which sets up bond/angle distances.
+  // tolerance, max_iter, bond_flag[], angle_flag[] must already be set
+  // (done in constructor via shake_tol, shake_iter, shake_bond, shake_angle).
+  FixRattle::init();
+
+  // Identify SHAKE clusters using the already-set bond_flag/angle_flag.
+  // This fills shake_flag[], shake_atom[][], etc.
+  // Needs to run after FixShake::init() (which computes bond_distance from force field).
+  find_clusters();
+
   // recheck that dilate group has not been deleted
 
   if (allremap == 0)
@@ -665,6 +819,7 @@ void FixNH::init()
     if (temperature->tempbias) which = BIAS;
     else which = NOBIAS;
   }
+  printf("which = %d\n", which);
 
   if (pstat_flag) {
     pressure = modify->get_compute_by_id(id_press);
@@ -734,18 +889,47 @@ void FixNH::init()
   rfix.clear();
   for (const auto &ifix : modify->get_fix_list())
     if (ifix->rigid_flag) rfix.push_back(ifix);
+
+  double dt = update->dt;
+  double dt2 = 0.5 * dt;
+  lan_c1_t = exp(-gamma_t * dt);
+  lan_c2_t = sqrt((1.0 - lan_c1_t * lan_c1_t) * boltz * t_target);
+  lan_c1_t_2 = exp(-gamma_t * dt2);
+  lan_c2_t_2 = sqrt((1.0 - lan_c1_t_2 * lan_c1_t_2) * boltz * t_target);
+
+  // printf("gamma_t: %f lan_c1_t: %f lan_c2_t: %f\n", gamma_t, lan_c1_t, lan_c2_t);
+  // printf("mvv2e: %f\n", force->mvv2e);
+
+  lan_c1_p = exp(-gamma_p * dt);
+  if (big_omega_update_flag == 1 && pstyle == ISO) lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target);
+  else lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target / pdim);
+  lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target);
+  lan_c1_p_2 = exp(-gamma_p * dt2);
+    if (big_omega_update_flag == 1 && pstyle == ISO) lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target);
+    else lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target / pdim);
+
 }
 
 /* ----------------------------------------------------------------------
    compute T,P before integrator starts
 ------------------------------------------------------------------------- */
 
-void FixNH::setup(int /*vflag*/)
+void FixNHCon::setup(int vflag)
 {
+  // SHAKE/RATTLE setup: correct initial coordinates and velocities
+  // before the first integration step
+  if (nlist > 0) {
+    // pre_neighbor sets local x,v,f pointers and builds the constraint list
+    pre_neighbor();
+    correct_coordinates(vflag);
+    correct_velocities();
+  }
+
   // tdof needed by compute_temp_target()
 
   t_current = temperature->compute_scalar();
   tdof = temperature->dof;
+  printf("tdof = %.16e\n", tdof);
 
   // t_target is needed by NVT and NPT in compute_scalar()
   // If no thermostat or using fix nphug,
@@ -797,18 +981,26 @@ void FixNH::setup(int /*vflag*/)
 
   // masses and initial forces on barostat variables
 
+
   if (pstat_flag) {
     double kt = boltz * t_target;
-    double nkt = (atom->natoms + 1) * kt;
+    double nkt;
+    if (big_mass_flag) nkt = (3*atom->natoms + 1) * kt;
+    else nkt = (atom->natoms +1) * kt;
+
 
     for (int i = 0; i < 3; i++)
       if (p_flag[i])
-        omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+        omega_mass[i] = nkt * tau_baro * tau_baro * omega_mass_corr;
 
     if (pstyle == TRICLINIC) {
       for (int i = 3; i < 6; i++)
-        if (p_flag[i]) omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+        if (p_flag[i]) omega_mass[i] = nkt * tau_baro * tau_baro * omega_mass_corr;
     }
+    printf("omega_mass= %.16e %.16e %.16e %.16e %.16e %.16e\n", omega_mass[0], omega_mass[1], omega_mass[2],
+         omega_mass[3], omega_mass[4], omega_mass[5]);
+    printf("nktv2p= %.16e\n", nktv2p);
+    printf("boltz= %.16e\n", boltz);
 
   // masses and initial forces on barostat thermostat variables
 
@@ -824,21 +1016,37 @@ void FixNH::setup(int /*vflag*/)
   }
 }
 
+
+
 /* ----------------------------------------------------------------------
    1st half of Verlet update
 ------------------------------------------------------------------------- */
 
-void FixNH::initial_integrate(int /*vflag*/)
+void FixNHCon::initial_integrate(int vflag)
 {
+  vflag_post_force = vflag;
+
+  if (integrator == MIDDLE) {
+    initial_integrate_middle();
+    return;
+  }
+
   // update eta_press_dot
 
-  if (pstat_flag && mpchain) nhc_press_integrate();
+  if (pstat_flag && mpchain){
+    if (nh_press_flag == 1) {
+      if (big_omega_update_flag == 1 && pstyle == ISO) nhc_press_integrate_iso();
+      else nhc_press_integrate();
+    }
+    else if (nh_press_flag == 0) langevin_press();
+  }
 
   // update eta_dot
 
   if (tstat_flag) {
     compute_temp_target();
-    nhc_temp_integrate();
+    if (nh_temp_flag == 1) nhc_temp_integrate();
+    else if (nh_temp_flag == 0) langevin_temp();
   }
 
   // need to recompute pressure to account for change in KE
@@ -860,16 +1068,27 @@ void FixNH::initial_integrate(int /*vflag*/)
   if (pstat_flag) {
     compute_press_target();
     nh_omega_dot();
+
+    // update_omega_dot();
     nh_v_press();
+    // scale_v();
   }
 
   nve_v();
+
+  // RATTLE velocity constraint: remove v components along constrained bonds
+  apply_rattle_velocity_constraints();
 
   // remap simulation box by 1/2 step
 
   if (pstat_flag) remap();
 
   nve_x();
+
+  // SHAKE position constraint: enforce bond length constraints
+  // pre_neighbor refreshes local x,v,f pointers
+  pre_neighbor();
+  apply_shake_position_constraints(vflag);
 
   // remap simulation box by 1/2 step
   // redo KSpace coeffs since volume has changed
@@ -884,9 +1103,17 @@ void FixNH::initial_integrate(int /*vflag*/)
    2nd half of Verlet update
 ------------------------------------------------------------------------- */
 
-void FixNH::final_integrate()
+void FixNHCon::final_integrate()
 {
+  if (integrator == MIDDLE) {
+    final_integrate_middle();
+    return;
+  }
+
   nve_v();
+
+  // RATTLE velocity constraint: remove v components along constrained bonds
+  apply_rattle_velocity_constraints();
 
   // re-compute temp before nh_v_press()
   // only needed for temperature computes with BIAS on reneighboring steps:
@@ -898,6 +1125,8 @@ void FixNH::final_integrate()
     t_current = temperature->compute_scalar();
 
   if (pstat_flag) nh_v_press();
+  // if (pstat_flag) scale_v();
+  
 
   // compute new T,P after velocities rescaled by nh_v_press()
   // compute appropriately coupled elements of mvv_current
@@ -920,18 +1149,375 @@ void FixNH::final_integrate()
   }
 
   if (pstat_flag) nh_omega_dot();
+  // if (pstat_flag) update_omega_dot();
 
   // update eta_dot
   // update eta_press_dot
 
-  if (tstat_flag) nhc_temp_integrate();
-  if (pstat_flag && mpchain) nhc_press_integrate();
+//   if (tstat_flag) nhc_temp_integrate();
+  if (tstat_flag) {
+    if (nh_temp_flag == 1) nhc_temp_integrate();
+    else if (nh_temp_flag == 0) langevin_temp();
+  }
+
+//   if (pstat_flag && mpchain) nhc_press_integrate();
+  if (pstat_flag && mpchain){
+    if (nh_press_flag == 1) {
+      if (big_omega_update_flag == 1 && pstyle == ISO) nhc_press_integrate_iso();
+      else nhc_press_integrate();
+    }
+    else if (nh_press_flag == 0) langevin_press();
+  }
+
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::initial_integrate_respa(int /*vflag*/, int ilevel, int /*iloop*/)
+
+void FixNHCon::initial_integrate_middle()
 {
+  // If we hacked the velocities at end_of_step (for thermo output to match t_initial),
+  // we MUST restore them now before any physics happens!
+  if (v_stored) {
+    if (!v_storage) error->one(FLERR, "FixNPTLangevin: v_storage missing!");
+    
+    double **v = atom->v;
+    int nlocal = atom->nlocal;
+    for (int i = 0; i < nlocal; i++) {
+        v[i][0] = v_storage[i][0];
+        v[i][1] = v_storage[i][1];
+        v[i][2] = v_storage[i][2];
+    }
+    v_stored = 0;
+    
+    // Also clear the fake virial contribution we added for thermo
+    for (int k = 0; k < 6; k++) virial[k] = 0.0;
+  }
+
+  // B: half-step velocity update
+  nve_v();
+  nh_v_press();
+
+  // RATTLE velocity constraint: remove v components along constrained bonds
+  apply_rattle_velocity_constraints();
+
+  if (pstat_flag) {
+    if (pstyle == ISO) {
+      temperature->compute_scalar();
+      pressure->compute_scalar();
+    } else {
+      temperature->compute_vector();
+      pressure->compute_vector();
+    }
+    couple();
+    pressure->addstep(update->ntimestep+1);
+  }
+  if (pstat_flag) {
+    compute_press_target();
+    nh_omega_dot();
+  }
+
+  // A: half-step box remap
+  if (pstat_flag) remap();
+  // A: full-step position update
+  nve_x_half();
+
+  // O: Langevin kicks on particles and barostat
+
+  if (pstat_flag && mpchain){
+    if (nh_press_flag == 1) {
+      if (big_omega_update_flag == 1 && pstyle == ISO) nhc_press_integrate_iso();
+      else nhc_press_integrate();
+    }
+    else if (nh_press_flag == 0) langevin_press();
+  }
+
+
+  if (tstat_flag) {
+    compute_temp_target();
+    if (nh_temp_flag == 1) nhc_temp_integrate();
+    else if (nh_temp_flag == 0) langevin_temp();
+  }
+
+  // A: full-step position update (second half)
+  nve_x_half();
+
+  // SHAKE position constraint: enforce bond length constraints
+  apply_shake_position_constraints(vflag_post_force);
+
+  // A: half-step box remap (second half)
+
+  if (pstat_flag) {
+    remap();
+    if (kspace_flag) force->kspace->setup();
+  }
+}
+
+void FixNHCon::final_integrate_middle()
+{
+  // measure fresh T and P from newly computed forces (Physics requires this!)
+
+  t_current = temperature->compute_scalar();
+  tdof = temperature->dof;
+
+  // need to recompute pressure to account for change in KE
+  // t_current is up-to-date, but compute_temperature is not
+  // compute appropriately coupled elements of mvv_current
+
+  if (pstat_flag) {
+    if (pstyle == ISO) pressure->compute_scalar();
+    else {
+      temperature->compute_vector();
+      pressure->compute_vector();
+    }
+    couple();
+    pressure->addstep(update->ntimestep+1);
+  }
+
+  // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
+  // Only execute this when thermo output is active for this step
+  if (output->next_thermo == update->ntimestep) {
+    if (atom->nmax > nmax) {
+      nmax = atom->nmax;
+      // We reallocate both here since nmax tracks both
+      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
+      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+    }
+
+    double **v = atom->v;
+
+    int nlocal = atom->nlocal;
+    for (int i = 0; i < nlocal; i++) {
+        v_backup[i][0] = v[i][0];
+        v_backup[i][1] = v[i][1];
+        v_backup[i][2] = v[i][2];
+    }
+  }
+  
+  // half-step barostat omega update using fresh P
+  if (pstat_flag) {
+    nh_omega_dot();
+    nh_v_press();
+  }
+
+  nve_v();
+
+  // RATTLE velocity constraint: remove v components along constrained bonds
+  apply_rattle_velocity_constraints();
+}
+
+void FixNHCon::end_of_step()
+{
+  // "Output Hack" Revised:
+  // To satisfy the requirement of recording correct "internal distribution" and "virial data"
+  // corresponding to the beginning of final_integrate, we physically restore the velocity state v(t+dt/2).
+  // 
+  // 1. Save current v(t+dt) to v_storage (to be restored in next initial_integrate).
+  // 2. Overwrite v with v_backup (v(t+dt/2)).
+  // 3. Do NOT modify virial manually; the position/force state is identical to start of final_integrate,
+  //    so ComputePressure will yield the correct virial contribution automatically.
+  
+  if (output->next_thermo == update->ntimestep) {
+    if (atom->nmax > nmax) {
+      nmax = atom->nmax;
+      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
+      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+    }
+  
+    double **v = atom->v;
+    int nlocal = atom->nlocal;
+  
+    // 1. Save valid v(t+dt)
+    for (int i=0; i<nlocal; i++) {
+        v_storage[i][0] = v[i][0];
+        v_storage[i][1] = v[i][1];
+        v_storage[i][2] = v[i][2];
+    }
+    v_stored = 1;
+
+    // 2. Restore v(t+dt/2)
+    if (v_backup) {
+        for (int i=0; i<nlocal; i++) {
+           v[i][0] = v_backup[i][0];
+           v[i][1] = v_backup[i][1];
+           v[i][2] = v_backup[i][2];
+        }
+    }
+  }
+
+  // Force re-computation of Temperature/Pressure?
+  // Thermo will ask for these.
+  // If thermo uses a distinct compute, it will calculate from current v (which is now v_backup) -> Correct.
+  // If thermo uses fix's compute, it might use cached value from start of final_integrate -> Correct.
+  // We can force clear the cache to be safe, but LAMMPS API doesn't easily support "un-invoking".
+  // However, since we matched the state, the cached value is consistent with current state anyway.
+}
+/* ----------------------------------------------------------------------
+   Langevin thermostat O-step on particle velocities.
+---------------------------------------------------------------------- */
+
+void FixNHCon::langevin_temp()
+{
+  double lan_coeff1, lan_coeff2;
+  if (integrator == MIDDLE){  // whole update 
+    lan_coeff1 = lan_c1_t;
+    lan_coeff2 = lan_c2_t;
+  } 
+  else if (integrator == SIDE) {  // half update
+    lan_coeff1 = lan_c1_t_2;
+    lan_coeff2 = lan_c2_t_2;
+  } else error->one(FLERR, "Invalid integrator setting in FixNHCon::langevin_press()");
+  
+  double **v   = atom->v;
+  double *mass = atom->mass;
+  double *rmass= atom->rmass;
+  double mvv2e = force->mvv2e;
+  int nlocal   = atom->nlocal;
+  double *fran = nullptr;
+  double fsum[4] = {0.0, 0.0, 0.0, 0.0};
+  double fsumall[4] = {0.0, 0.0, 0.0, 0.0};
+
+
+  if (zero_flag) {
+    fran = new double[3*nlocal];
+  }
+
+  if (rmass) {
+    for (int i = 0; i < nlocal; i++) {
+      double inv_sqrt_m = 1.0 / sqrt(rmass[i] * mvv2e);
+      double fran0 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      double fran1 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      double fran2 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      double mass_i = rmass[i];
+      if (zero_flag) {
+        fran[3*i] = fran0;
+        fran[3*i+1] = fran1;
+        fran[3*i+2] = fran2;
+        fsum[0] += mass_i * fran0;
+        fsum[1] += mass_i * fran1;
+        fsum[2] += mass_i * fran2;
+        fsum[3] += mass_i;
+      }
+      v[i][0] = lan_coeff1 * v[i][0] + fran0;
+      v[i][1] = lan_coeff1 * v[i][1] + fran1;
+      v[i][2] = lan_coeff1 * v[i][2] + fran2;
+    }
+  } else {
+    for (int i = 0; i < nlocal; i++) {
+      double mass_i = mass[atom->type[i]];
+      double inv_sqrt_m = 1.0 / sqrt(mass_i * mvv2e);
+      double fran0 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      double fran1 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      double fran2 = lan_coeff2 * random->gaussian() * inv_sqrt_m;
+      if (zero_flag) {
+        fran[3*i] = fran0;
+        fran[3*i+1] = fran1;
+        fran[3*i+2] = fran2;
+        fsum[0] += mass_i * fran0;
+        fsum[1] += mass_i * fran1;
+        fsum[2] += mass_i * fran2;
+        fsum[3] += mass_i;
+      }
+      v[i][0] = lan_coeff1 * v[i][0] + fran0;
+      // printf("term1: %f term2: %f\n", lan_coeff1 * v[i][0], lan_coeff2 * random->gaussian() * inv_sqrt_m);
+      v[i][1] = lan_coeff1 * v[i][1] + fran1;
+      v[i][2] = lan_coeff1 * v[i][2] + fran2;
+    }
+  }
+
+  if (zero_flag) {
+    MPI_Allreduce(fsum, fsumall, 4, MPI_DOUBLE, MPI_SUM, world);
+    double inv_tmass = 1.0 / fsumall[3];
+    double correction[3] = {fsumall[0] * inv_tmass, fsumall[1] * inv_tmass, fsumall[2] * inv_tmass};
+
+    for (int i = 0; i < nlocal; i++) {
+      v[i][0] -= correction[0];
+      v[i][1] -= correction[1];
+      v[i][2] -= correction[2];
+    }
+
+    delete[] fran;
+  }
+}
+
+/* ----------------------------------------------------------------------
+   Langevin O-step on barostat velocities omega[6].
+   All 6 components generated on rank 0 and broadcast as one array.
+---------------------------------------------------------------------- */
+
+void FixNHCon::langevin_press()
+{
+  double lan_coeff1, lan_coeff2;
+  if (integrator == MIDDLE){  // whole update 
+    lan_coeff1 = lan_c1_p;
+    lan_coeff2 = lan_c2_p;
+  } 
+  else if (integrator == SIDE) {  // half update
+    lan_coeff1 = lan_c1_p_2;
+    lan_coeff2 = lan_c2_p_2;
+  } else error->one(FLERR, "Invalid integrator setting in FixNHCon::langevin_press()");
+  
+  double kt = boltz * t_target;
+  int i;
+  // Update masses, to preserve initial freq, if flag set
+
+  if (omega_mass_flag) {
+    double nkt;
+    if (big_mass_flag) nkt = (3 * atom->natoms + 1) * kt;
+    else nkt = (atom->natoms + 1) * kt;
+    for (i = 0; i < 3; i++)
+      if (p_flag[i])
+        omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+
+    if (pstyle == TRICLINIC) {
+      for (i = 3; i < 6; i++)
+        if (p_flag[i]) omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+    }
+  }
+
+
+  double kicks[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+  if (comm->me == 0) {
+    if (pcouple == XYZ) {
+      double kick = lan_coeff2 * random->gaussian() / sqrt(omega_mass[0]);
+      kicks[0] = kicks[1] = kicks[2] = kick;
+    } else if (pcouple == XY) {
+      double kick = lan_coeff2 * random->gaussian() / sqrt(omega_mass[0]);
+      kicks[0] = kicks[1] = kick;
+      if (p_flag[2]) kicks[2] = lan_coeff2 * random->gaussian() / sqrt(omega_mass[2]);
+    } else if (pcouple == YZ) {
+      double kick = lan_coeff2 * random->gaussian() / sqrt(omega_mass[1]);
+      kicks[1] = kicks[2] = kick;
+      if (p_flag[0]) kicks[0] = lan_coeff2 * random->gaussian() / sqrt(omega_mass[0]);
+    } else if (pcouple == XZ) {
+      double kick = lan_coeff2 * random->gaussian() / sqrt(omega_mass[0]);
+      kicks[0] = kicks[2] = kick;
+      if (p_flag[1]) kicks[1] = lan_coeff2 * random->gaussian() / sqrt(omega_mass[1]);
+    } else {
+      for (int i = 0; i < 6; i++) {
+        if (p_flag[i])
+          kicks[i] = lan_coeff2 * random->gaussian() / sqrt(omega_mass[i]);
+      }
+    }
+  }
+
+  MPI_Bcast(kicks, 6, MPI_DOUBLE, 0, world);
+  // printf("kicks: %.16e %.16e %.16e %.16e %.16e %.16e\n", kicks[0], kicks[1], kicks[2], kicks[3], kicks[4], kicks[5]);
+
+  for (int i = 0; i < 6; i++) {
+    if (p_flag[i])
+      omega_dot[i] = lan_coeff1 * omega_dot[i] + kicks[i];
+  }
+}
+
+
+
+void FixNHCon::initial_integrate_respa(int vflag, int ilevel, int /*iloop*/)
+{
+  // store vflag for SHAKE constraint
+  vflag_post_force = vflag;
+
   // set timesteps by level
 
   dtv = step_respa[ilevel];
@@ -979,6 +1565,9 @@ void FixNH::initial_integrate_respa(int /*vflag*/, int ilevel, int /*iloop*/)
 
     nve_v();
 
+    // RATTLE velocity constraint at outermost respa level
+    apply_rattle_velocity_constraints();
+
   } else nve_v();
 
   // innermost level - also update x only for atoms in group
@@ -987,13 +1576,17 @@ void FixNH::initial_integrate_respa(int /*vflag*/, int ilevel, int /*iloop*/)
   if (ilevel == 0) {
     if (pstat_flag) remap();
     nve_x();
+
+    // SHAKE position constraint at innermost respa level
+    apply_shake_position_constraints(vflag_post_force);
+
     if (pstat_flag) remap();
   }
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::pre_force_respa(int /*vflag*/, int ilevel, int /*iloop*/)
+void FixNHCon::pre_force_respa(int /*vflag*/, int ilevel, int /*iloop*/)
 {
   // if barostat, redo KSpace coeffs at outermost level,
   // since volume has changed
@@ -1004,7 +1597,7 @@ void FixNH::pre_force_respa(int /*vflag*/, int ilevel, int /*iloop*/)
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::final_integrate_respa(int ilevel, int /*iloop*/)
+void FixNHCon::final_integrate_respa(int ilevel, int /*iloop*/)
 {
   // set timesteps by level
 
@@ -1015,12 +1608,15 @@ void FixNH::final_integrate_respa(int ilevel, int /*iloop*/)
   // all other levels - NVE update of v
 
   if (ilevel == nlevels_respa-1) final_integrate();
-  else nve_v();
+  else {
+    nve_v();
+    apply_rattle_velocity_constraints();
+  }
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::couple()
+void FixNHCon::couple()
 {
   double *tensor = pressure->vector;
 
@@ -1062,13 +1658,242 @@ void FixNH::couple()
   }
 }
 
+
+
+
+/* ----------------------------------------------------------------------
+   Helper functions for exp_omega to ensure numerical stability
+   when eigenvalues are degenerate or nearly so.
+------------------------------------------------------------------------- */
+
+static inline double phi(double x)
+{
+  const double eps = 1e-8;
+
+  if (fabs(x) < eps) {
+    // 4th order Taylor
+    return 1.0 + x*0.5 + x*x/6.0 + x*x*x/24.0 + x*x*x*x/120.0;
+  }
+
+  return expm1(x) / x;
+}
+
+
+static inline double diff_val(double x, double y)
+{
+  double d = x - y;
+
+  if (fabs(d) < 1e-8) {
+    // limit → exp(x)
+    return exp(x);
+  }
+
+  // exp(y) * phi(x-y)
+  return exp(y) * phi(d);
+}
+
+static double diff2_val(double x, double y, double z) {
+  double d = y - z;
+  double val1 = diff_val(x, y);
+  double val2 = diff_val(x, z);
+
+  if (fabs(d) < 1.0e-6) {
+    // Derivative of diff_val(x, y) with respect to y
+    // d/dy [ (e^x - e^y)/(x - y) ]
+    // = e^y * (e^(x-y) - 1 - (x-y)) / (x-y)^2
+    double v = x - y;
+    if (fabs(v) < 1.0e-6) // Taylor for (e^v - 1 - v)/v^2 -> 1/2 + v/6 + v^2/24
+      return exp(y) * (0.5 + v/6.0 + v*v/24.0);
+    return exp(y) * (exp(v) - 1.0 - v) / (v * v);
+  }
+  return (val1 - val2) / d;
+}
+
+// stable divided difference
+
+void FixNHCon::mat_exp(double delta_t, const double *mat)
+{
+  double exponent[6];
+  for (int i=0; i <  6; i++)
+    exponent[i] = delta_t * mat[i];
+  double exp_mat[6];
+  exp_mat[0] = exp(exponent[0]);
+  exp_mat[1] = exp(exponent[1]);
+  exp_mat[2] = exp(exponent[2]);
+
+  exp_mat[3] = exp_mat[4] = exp_mat[5] = 0.0;
+
+  if (pstyle == TRICLINIC) {
+    double d01 = diff_val(exponent[0], exponent[1]);
+    double d12 = diff_val(exponent[1], exponent[2]);
+    double d02 = diff_val(exponent[0], exponent[2]);
+    exp_mat[5] = exponent[5] * d01;
+    exp_mat[3] = exponent[3] * d12;
+    double term1 = exponent[4] * d02;
+    double denom = exponent[1] - exponent[2];
+    double term2;
+    if (fabs(denom) < 1e-8) {
+      // ω1 ≈ ω2 退化情况
+      // 使用极限：
+      // (diff01 - diff02)/(ω1-ω2) → ∂/∂ω1 diff(ω0, ω1)
+
+      double x = exponent[0];
+      double y = exponent[1];
+
+      // derivative of diff(x,y) wrt y
+      // diff = exp(y) * phi(x-y)
+      // d/dy = exp(y)*phi + exp(y)*phi'*(-1)
+
+      double d = x - y;
+      double expy = exp(y);
+
+      double ph = phi(d);
+
+      double ph_prime;
+      if (fabs(d) < 1e-8) {
+        // derivative of phi at 0
+        ph_prime = 0.5 + d/3.0;
+      } else {
+        ph_prime =
+          ( (d*exp(d) - expm1(d)) / (d*d) );
+      }
+
+      double derivative = expy * ph - expy * ph_prime;
+
+      term2 = exponent[3] * exponent[5] * derivative;
+    }
+    else {
+      term2 = exponent[3] * exponent[5]
+            * (d01 - d02) / denom;
+    }
+    exp_mat[4] = term1 + term2;
+  }
+
+  for (int i = 0; i < 6; i++) omegadot_exp[i] = exp_mat[i];
+
+}
+
+void FixNHCon::remap_me()
+{
+  int nlocal = atom->nlocal;
+  double *h  = domain->h;
+  double dt2 = 0.5 * update->dt;
+  mat_exp(dt2, omega_dot);  // now using the positive sign for position
+
+  // 1. Convert atoms to fractional coords using the OLD box
+  domain->x2lamda(nlocal);
+
+  // 2. Update box dimensions using the matrix exponential M = exp(Omega * dt/2)
+  // We use mode 0 (positive argument) for box expansion.
+  double *w_exp = omegadot_exp;
+
+  // H_new = M * H_old
+  double h0 = h[0];
+  double h1 = h[1];
+  double h2 = h[2];
+  double h3 = h[3]; // yz
+  double h4 = h[4]; // xz
+  double h5 = h[5]; // xy
+  
+  // Diagonal update
+  h[0] = w_exp[0] * h0;
+  h[1] = w_exp[1] * h1;
+  h[2] = w_exp[2] * h2;
+  
+  // Off-diagonal update
+  if (pstyle == TRICLINIC) {
+    // h5 (xy) = m0*h5 + m5*h1
+    h[5] = w_exp[0]*h5 + w_exp[5]*h1;
+    
+    // h4 (xz) = m0*h4 + m5*h3 + m4*h2 -- Wait, matrix multiply:
+    // Row 0 of M is [m0 m5 m4]
+    // Col 2 of H is [h4 h3 h2]^T
+    // Product (0,2) = m0*h4 + m5*h3 + m4*h2. Correct.
+    h[4] = w_exp[0]*h4 + w_exp[5]*h3 + w_exp[4]*h2;
+    
+    // h3 (yz) = m1*h3 + m3*h2
+    h[3] = w_exp[1]*h3 + w_exp[3]*h2;
+    
+    // Update domain tilt factors to match h
+    domain->yz = h[3];
+    domain->xz = h[4];
+    domain->xy = h[5];
+  }
+  
+  // Update box boundaries (centered scaling)
+  // X
+  double oldlo = domain->boxlo[0]; 
+  double oldhi = domain->boxhi[0];
+  double center = 0.5*(oldlo+oldhi);
+  double half = 0.5*(h[0]);
+  domain->boxlo[0] = center - half;
+  domain->boxhi[0] = center + half;
+
+  // Y
+  oldlo = domain->boxlo[1]; 
+  oldhi = domain->boxhi[1];
+  center = 0.5*(oldlo+oldhi);
+  half = 0.5*(h[1]);
+  domain->boxlo[1] = center - half;
+  domain->boxhi[1] = center + half;
+  
+  // Z
+  oldlo = domain->boxlo[2]; 
+  oldhi = domain->boxhi[2];
+  center = 0.5*(oldlo+oldhi);
+  half = 0.5*(h[2]);
+  domain->boxlo[2] = center - half;
+  domain->boxhi[2] = center + half;
+
+  // 3. Rebuild global/local box
+  domain->set_global_box();
+  domain->set_local_box();
+
+  // 4. Convert atoms back to Cartesian using the NEW box
+  // This effectively applies the deformation x_new = H_new * H_old^-1 * x_old
+  domain->lamda2x(nlocal);
+  
+  // Also deform rigid bodies if any (from fix_nh logic)
+  // for (auto &ifix : rfix) ifix->deform(0); 
+  // (Not in original code provided, but good to keep in mind if adapting)
+}
+
+void FixNHCon::scale_v()
+{
+  double **v = atom->v;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+
+  double dt2 = 0.5 * update->dt;
+  mat_exp(-dt2, omega_dot);
+
+  double *w_exp = omegadot_exp;
+  double omegadot_trace = omega_dot[0] + omega_dot[1] + omega_dot[2];
+  double factor = exp(-dt2 * omegadot_trace/(3 * atom->natoms));
+  for (int i = 0; i < nlocal; i++){
+    double v0 = v[i][0];
+    double v1 = v[i][1];
+    double v2 = v[i][2];
+
+    // Apply matrix exponential scaling (exp(-Omega * dt/2))
+    v[i][0] = w_exp[0]*v0 + w_exp[5]*v1 + w_exp[4]*v2;
+    v[i][1] = w_exp[1]*v1 + w_exp[3]*v2;
+    v[i][2] = w_exp[2]*v2;
+    
+    // Apply MTK correction factor
+    v[i][0] *= factor;
+    v[i][1] *= factor;
+    v[i][2] *= factor;
+
+  }
+}
 /* ----------------------------------------------------------------------
    change box size
    remap all atoms or dilate group atoms depending on allremap flag
    if rigid bodies exist, scale rigid body centers-of-mass
 ------------------------------------------------------------------------- */
 
-void FixNH::remap()
+void FixNHCon::remap()
 {
   int i;
   double oldlo,oldhi;
@@ -1244,7 +2069,7 @@ void FixNH::remap()
    pack entire state of Fix into one write
 ------------------------------------------------------------------------- */
 
-void FixNH::write_restart(FILE *fp)
+void FixNHCon::write_restart(FILE *fp)
 {
   int nsize = size_restart_global();
 
@@ -1266,7 +2091,7 @@ void FixNH::write_restart(FILE *fp)
     calculate the number of data to be packed
 ------------------------------------------------------------------------- */
 
-int FixNH::size_restart_global()
+int FixNHCon::size_restart_global()
 {
   int nsize = 2;
   if (tstat_flag) nsize += 1 + 2*mtchain;
@@ -1282,7 +2107,7 @@ int FixNH::size_restart_global()
    pack restart data
 ------------------------------------------------------------------------- */
 
-int FixNH::pack_restart_data(double *list)
+int FixNHCon::pack_restart_data(double *list)
 {
   int n = 0;
 
@@ -1337,7 +2162,7 @@ int FixNH::pack_restart_data(double *list)
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 
-void FixNH::restart(char *buf)
+void FixNHCon::restart(char *buf)
 {
   int n = 0;
   auto *list = (double *) buf;
@@ -1388,7 +2213,7 @@ void FixNH::restart(char *buf)
 
 /* ---------------------------------------------------------------------- */
 
-int FixNH::modify_param(int narg, char **arg)
+int FixNHCon::modify_param(int narg, char **arg)
 {
   if (strcmp(arg[0],"temp") == 0) {
     if (narg < 2) error->all(FLERR,"Illegal fix_modify command");
@@ -1442,7 +2267,7 @@ int FixNH::modify_param(int narg, char **arg)
 
 /* ---------------------------------------------------------------------- */
 
-double FixNH::compute_scalar()
+double FixNHCon::compute_scalar()
 {
   int i;
   double volume;
@@ -1524,7 +2349,7 @@ double FixNH::compute_scalar()
   ndof = 1,3,6 degrees of freedom for pstyle = ISO,ANISO,TRI
 ------------------------------------------------------------------------- */
 
-double FixNH::compute_vector(int n)
+double FixNHCon::compute_vector(int n)
 {
   int ilen;
 
@@ -1686,7 +2511,7 @@ double FixNH::compute_vector(int n)
 
 /* ---------------------------------------------------------------------- */
 
-std::string FixNH::get_thermo_colname(int n)
+std::string FixNHCon::get_thermo_colname(int n)
 {
 
   // scalar value if n == -1
@@ -1840,14 +2665,14 @@ std::string FixNH::get_thermo_colname(int n)
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::reset_target(double t_new)
+void FixNHCon::reset_target(double t_new)
 {
   t_target = t_start = t_stop = t_new;
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixNH::reset_dt()
+void FixNHCon::reset_dt()
 {
   dtv = update->dt;
   dtf = 0.5 * update->dt * force->ftm2v;
@@ -1871,13 +2696,16 @@ void FixNH::reset_dt()
 
   if (tstat_flag)
     tdrag_factor = 1.0 - (update->dt * t_freq * drag / nc_tchain);
+
+  // also update SHAKE/RATTLE constraint timesteps
+  FixRattle::reset_dt();
 }
 
 /* ----------------------------------------------------------------------
    extract thermostat properties
 ------------------------------------------------------------------------- */
 
-void *FixNH::extract(const char *str, int &dim)
+void *FixNHCon::extract(const char *str, int &dim)
 {
   dim=0;
   if (tstat_flag && strcmp(str,"t_target") == 0) {
@@ -1912,7 +2740,7 @@ void *FixNH::extract(const char *str, int &dim)
    perform half-step update of chain thermostat variables
 ------------------------------------------------------------------------- */
 
-void FixNH::nhc_temp_integrate()
+void FixNHCon::nhc_temp_integrate()
 {
   int ich;
   double expfac;
@@ -1978,12 +2806,221 @@ void FixNH::nhc_temp_integrate()
   }
 }
 
+void FixNHCon::nhc_press_integrate_iso()  //only used when ISO
+{
+  int ich,i,pdof;
+  double expfac,factor_etap,kecurrent[3];
+  double kt = boltz * t_target;
+  double lkt_press;
+
+  // Update masses, to preserve initial freq, if flag set
+
+  if (omega_mass_flag) {
+    double nkt;
+    if (big_mass_flag) nkt = (3 * atom->natoms + 1) * kt;
+    else nkt = (atom->natoms + 1) * kt;
+    for (i = 0; i < 3; i++)
+      if (p_flag[i])
+        omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+  }
+
+  if (etap_mass_flag) {
+    if (mpchain) {
+      etap_mass[0] = boltz * t_target / (p_freq_max*p_freq_max);
+      for (ich = 1; ich < mpchain; ich++)
+        etap_mass[ich] = boltz * t_target / (p_freq_max*p_freq_max);
+      for (ich = 1; ich < mpchain; ich++)
+        etap_dotdot[ich] =
+          (etap_mass[ich-1]*etap_dot[ich-1]*etap_dot[ich-1] -
+           boltz * t_target) / etap_mass[ich];
+    }
+  }
+
+  kecurrent[0] = 0.0;
+  kecurrent[1] = 0.0;
+  kecurrent[2] = 0.0;// anyway when ISO, these are the same
+  pdof = 0;
+  for (i = 0; i < 3; i++)
+    if (p_flag[i]) {
+      kecurrent[i] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+      pdof++;
+    }
+  lkt_press = kt;
+  etap_dotdot[0] = (kecurrent[0] - lkt_press)/etap_mass[0];
+
+  double ncfac = 1.0/nc_pchain;
+  for (int iloop = 0; iloop < nc_pchain; iloop++) {
+
+    for (ich = mpchain-1; ich > 0; ich--) {
+      expfac = exp(-ncfac*dt8*etap_dot[ich+1]);
+      etap_dot[ich] *= expfac;
+      etap_dot[ich] += etap_dotdot[ich] * ncfac*dt4;
+      etap_dot[ich] *= pdrag_factor;
+      etap_dot[ich] *= expfac;
+    }
+
+    expfac = exp(-ncfac*dt8*etap_dot[1]);
+
+    etap_dot[0] *= expfac;
+    etap_dot[0] += etap_dotdot[0] * ncfac*dt4;
+    etap_dot[0] *= pdrag_factor;
+    etap_dot[0] *= expfac;
+
+    for (ich = 0; ich < mpchain; ich++)
+      etap[ich] += ncfac*dthalf*etap_dot[ich];
+
+    factor_etap = exp(-ncfac*dthalf*etap_dot[0]);
+    for (i = 0; i < 3; i++)
+      if (p_flag[i]) omega_dot[i] *= factor_etap;
+
+    kecurrent[0] = 0.0;
+    kecurrent[1] = 0.0;
+    kecurrent[2] = 0.0;
+
+    for (i = 0; i < 3; i++)
+      if (p_flag[i]) kecurrent[i] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+
+    etap_dotdot[0] = (kecurrent[0] - lkt_press)/etap_mass[0];
+
+    etap_dot[0] *= expfac;
+    etap_dot[0] += etap_dotdot[0] * ncfac*dt4;
+    etap_dot[0] *= expfac;
+
+    for (ich = 1; ich < mpchain; ich++) {
+      expfac = exp(-ncfac*dt8*etap_dot[ich+1]);
+      etap_dot[ich] *= expfac;
+      etap_dotdot[ich] =
+        (etap_mass[ich-1]*etap_dot[ich-1]*etap_dot[ich-1] - boltz*t_target) /
+        etap_mass[ich];
+      etap_dot[ich] += etap_dotdot[ich] * ncfac*dt4;
+      etap_dot[ich] *= expfac;
+    }
+  }
+}
+
+void FixNHCon::nhc_press_integrate_me() // used when big_omega_update_flag is on
+{
+  int ich,i,pdof;
+  double expfac,factor_etap,kecurrent[3];
+  double kt = boltz * t_target;
+  double lkt_press;
+
+  // Update masses, to preserve initial freq, if flag set
+
+  if (omega_mass_flag) {
+    double nkt;
+    if (big_mass_flag) nkt = (3 * atom->natoms + 1) * kt;
+    else nkt = (atom->natoms + 1) * kt;
+    for (i = 0; i < 3; i++)
+      if (p_flag[i])
+        omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+
+    if (pstyle == TRICLINIC) {
+      for (i = 3; i < 6; i++)
+        if (p_flag[i]) omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
+    }
+  }
+
+  if (etap_mass_flag) {
+    if (mpchain) {
+      etap_mass[0] = boltz * t_target / (p_freq_max*p_freq_max);
+      for (ich = 1; ich < mpchain; ich++)
+        etap_mass[ich] = boltz * t_target / (p_freq_max*p_freq_max);
+      for (ich = 1; ich < mpchain; ich++)
+        etap_dotdot[ich] =
+          (etap_mass[ich-1]*etap_dot[ich-1]*etap_dot[ich-1] -
+           boltz * t_target) / etap_mass[ich];
+    }
+  }
+
+  kecurrent[0] = 0.0;
+  kecurrent[1] = 0.0;
+  kecurrent[2] = 0.0;// anyway when ISO, these are the same
+  pdof = 0;
+  for (i = 0; i < 3; i++)
+    if (p_flag[i]) {
+      kecurrent[i] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+      pdof++;
+    }
+
+  if (pstyle == TRICLINIC) {
+    for (i = 3; i < 6; i++)
+      if (p_flag[i]) {
+        kecurrent[i] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+        pdof++;
+      }
+  }
+
+  if (pstyle == ISO) lkt_press = kt;
+  else lkt_press = pdof * kt;
+  etap_dotdot[0] = (kecurrent[0] - lkt_press)/etap_mass[0];
+
+  double ncfac = 1.0/nc_pchain;
+  for (int iloop = 0; iloop < nc_pchain; iloop++) {
+
+    for (ich = mpchain-1; ich > 0; ich--) {
+      expfac = exp(-ncfac*dt8*etap_dot[ich+1]);
+      etap_dot[ich] *= expfac;
+      etap_dot[ich] += etap_dotdot[ich] * ncfac*dt4;
+      etap_dot[ich] *= pdrag_factor;
+      etap_dot[ich] *= expfac;
+    }
+
+    expfac = exp(-ncfac*dt8*etap_dot[1]);
+
+    etap_dot[0] *= expfac;
+    etap_dot[0] += etap_dotdot[0] * ncfac*dt4;
+    etap_dot[0] *= pdrag_factor;
+    etap_dot[0] *= expfac;
+
+    for (ich = 0; ich < mpchain; ich++)
+      etap[ich] += ncfac*dthalf*etap_dot[ich];
+
+    factor_etap = exp(-ncfac*dthalf*etap_dot[0]);
+    for (i = 0; i < 3; i++)
+      if (p_flag[i]) omega_dot[i] *= factor_etap;
+
+    if (pstyle == TRICLINIC) {
+      for (i = 3; i < 6; i++)
+        if (p_flag[i]) omega_dot[i] *= factor_etap;
+    }
+
+    kecurrent[0] = 0.0;
+    kecurrent[1] = 0.0;
+    kecurrent[2] = 0.0;
+    for (i = 0; i < 3; i++)
+      if (p_flag[i]) kecurrent[i] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+
+    if (pstyle == TRICLINIC) {
+      for (i = 3; i < 6; i++)
+        if (p_flag[i]) kecurrent[0] += omega_mass[i]*omega_dot[i]*omega_dot[i];
+    }
+
+    etap_dotdot[0] = (kecurrent[0] - lkt_press)/etap_mass[0];
+
+    etap_dot[0] *= expfac;
+    etap_dot[0] += etap_dotdot[0] * ncfac*dt4;
+    etap_dot[0] *= expfac;
+
+    for (ich = 1; ich < mpchain; ich++) {
+      expfac = exp(-ncfac*dt8*etap_dot[ich+1]);
+      etap_dot[ich] *= expfac;
+      etap_dotdot[ich] =
+        (etap_mass[ich-1]*etap_dot[ich-1]*etap_dot[ich-1] - boltz*t_target) /
+        etap_mass[ich];
+      etap_dot[ich] += etap_dotdot[ich] * ncfac*dt4;
+      etap_dot[ich] *= expfac;
+    }
+  }
+
+}
+
 /* ----------------------------------------------------------------------
    perform half-step update of chain thermostat variables for barostat
    scale barostat velocities
 ------------------------------------------------------------------------- */
 
-void FixNH::nhc_press_integrate()
+void FixNHCon::nhc_press_integrate()
 {
   int ich,i,pdof;
   double expfac,factor_etap,kecurrent;
@@ -1993,7 +3030,9 @@ void FixNH::nhc_press_integrate()
   // Update masses, to preserve initial freq, if flag set
 
   if (omega_mass_flag) {
-    double nkt = (atom->natoms + 1) * kt;
+    double nkt;
+    if (big_mass_flag) nkt = (3 * atom->natoms + 1) * kt;
+    else nkt = (atom->natoms + 1) * kt;
     for (i = 0; i < 3; i++)
       if (p_flag[i])
         omega_mass[i] = nkt/(p_freq[i]*p_freq[i]);
@@ -2096,7 +3135,7 @@ void FixNH::nhc_press_integrate()
    perform half-step barostat scaling of velocities
 -----------------------------------------------------------------------*/
 
-void FixNH::nh_v_press()
+void FixNHCon::nh_v_press()  // this is justing doing v-rescaling, onl difference on numerical implementation
 {
   double factor[3];
   double **v = atom->v;
@@ -2147,7 +3186,7 @@ void FixNH::nh_v_press()
    perform half-step update of velocities
 -----------------------------------------------------------------------*/
 
-void FixNH::nve_v()
+void FixNHCon::nve_v()
 {
   double dtfm;
   double **v = atom->v;
@@ -2184,7 +3223,7 @@ void FixNH::nve_v()
    perform full-step update of positions
 -----------------------------------------------------------------------*/
 
-void FixNH::nve_x()
+void FixNHCon::nve_x()
 {
   double **x = atom->x;
   double **v = atom->v;
@@ -2203,11 +3242,30 @@ void FixNH::nve_x()
   }
 }
 
+
+void FixNHCon::nve_x_half()
+{
+  double **x = atom->x;
+  double **v = atom->v;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+  if (igroup == atom->firstgroup) nlocal = atom->nfirst;
+
+  // x update by half step only for atoms in group
+
+  for (int i = 0; i < nlocal; i++) {
+    if (mask[i] & groupbit) {
+      x[i][0] += dthalf * v[i][0];
+      x[i][1] += dthalf * v[i][1];
+      x[i][2] += dthalf * v[i][2];
+    }
+  }
+}
 /* ----------------------------------------------------------------------
    perform half-step thermostat scaling of velocities
 -----------------------------------------------------------------------*/
 
-void FixNH::nh_v_temp()
+void FixNHCon::nh_v_temp()
 {
   double **v = atom->v;
   int *mask = atom->mask;
@@ -2240,7 +3298,7 @@ void FixNH::nh_v_temp()
    needed whenever p_target or h0_inv changes
 -----------------------------------------------------------------------*/
 
-void FixNH::compute_sigma()
+void FixNHCon::compute_sigma()
 {
   // if nreset_h0 > 0, reset vol0 and h0_inv
   // every nreset_h0 timesteps
@@ -2298,7 +3356,7 @@ void FixNH::compute_sigma()
    compute strain energy
 -----------------------------------------------------------------------*/
 
-double FixNH::compute_strain_energy()
+double FixNHCon::compute_strain_energy()
 {
   // compute strain energy = 0.5*Tr(sigma*h*h^t) in energy units
 
@@ -2326,7 +3384,7 @@ double FixNH::compute_strain_energy()
    compute deviatoric barostat force = h*sigma*h^t
 -----------------------------------------------------------------------*/
 
-void FixNH::compute_deviatoric()
+void FixNHCon::compute_deviatoric()
 {
   // generate upper-triangular part of h*sigma*h^t
   // units of fdev are are PV, e.g. atm*A^3
@@ -2362,7 +3420,7 @@ void FixNH::compute_deviatoric()
    compute target temperature and kinetic energy
 -----------------------------------------------------------------------*/
 
-void FixNH::compute_temp_target()
+void FixNHCon::compute_temp_target()
 {
   double delta = update->ntimestep - update->beginstep;
   if (delta != 0.0) delta /= update->endstep - update->beginstep;
@@ -2375,7 +3433,7 @@ void FixNH::compute_temp_target()
    compute hydrostatic target pressure
 -----------------------------------------------------------------------*/
 
-void FixNH::compute_press_target()
+void FixNHCon::compute_press_target()
 {
   double delta = update->ntimestep - update->beginstep;
   if (delta != 0.0) delta /= update->endstep - update->beginstep;
@@ -2397,13 +3455,73 @@ void FixNH::compute_press_target()
   if (deviatoric_flag) compute_sigma();
 }
 
+
+void FixNHCon::compute_f_omega()
+{
+double volume = domain->xprd * domain->yprd * domain->zprd;
+  double nktv2p = force->nktv2p;
+  // double kT     = tdof * boltz * t_current/(atom->natoms * 3);  // per-particle kinetic energy
+  double kT     = boltz * t_current;  // per-particle kinetic energy, not scaled by dof or natoms, since MTK correction already accounts for that
+
+  // compute hydrostatic target (average over active diagonal components)
+  p_hydro = 0.0;
+  int pdim = 0;
+  for (int i = 0; i < 6; i++)
+    force_omega[i] = 0.0;
+
+  double dt2 = 0.5 * update->dt;
+
+  for (int i = 0; i < 3; i++)
+    if (p_flag[i]) { p_hydro += p_target[i]; pdim++; }
+  if (pdim > 0) p_hydro /= pdim;
+
+  // diagonal: MTK-corrected
+  for (int i = 0; i < 3; i++) {
+    if (!p_flag[i]) continue;
+    force_omega[i] = volume / omega_mass[i] * (p_current[i] - p_hydro) / nktv2p
+             + kT / omega_mass[i];  // MTK correction
+    if (pstyle == ISO && big_omega_update_flag == 1) force_omega[i] *= 3.0;  // extra factor of 3 for iso since each omega drives all 3 axes
+    // omega_dot[i] += dt2 * force_omega[i]; //we add this force in the update_omega_dot function instead of here, since we want to compute the force first and then add it to omega_dot in a separate function
+  }
+
+  // off-diagonal: no MTK, target is zero (deviatoric stress)
+  if (pstyle == TRICLINIC) {
+    for (int i = 3; i < 6; i++) {
+      if (!p_flag[i]) continue;
+      force_omega[i] = volume / omega_mass[i] * p_current[i] / nktv2p;
+      // omega_dot[i] += dt2 * force_omega[i];
+      // printf("omega[%d]: %f\n", i, omega[i]);
+    }
+  }
+}
+
+void FixNHCon::update_omega_dot()
+{
+  compute_f_omega();
+  double dt2 = 0.5 * update->dt;
+  for (int i = 0; i < 6; i++) {
+    if (p_flag[i]) {
+      omega_dot[i] += dt2 * force_omega[i];
+    }
+  }
+
+  mtk_term2 = 0.0;
+  if (mtk_flag) {
+    for (int i = 0; i < 3; i++)
+      if (p_flag[i])
+        mtk_term2 += omega_dot[i];
+    if (pdim > 0) mtk_term2 /= pdim * atom->natoms;  // the same implementation as mine
+  }
+}
+
+
 /* ----------------------------------------------------------------------
    update omega_dot, omega
 -----------------------------------------------------------------------*/
 
-void FixNH::nh_omega_dot()
+void FixNHCon::nh_omega_dot()
 {
-  double f_omega,volume;
+  double f_omega[6],volume;
 
   if (dimension == 3) volume = domain->xprd*domain->yprd*domain->zprd;
   else volume = domain->xprd*domain->yprd;
@@ -2414,7 +3532,8 @@ void FixNH::nh_omega_dot()
   if (mtk_flag) {
     if (pstyle == ISO) {
       mtk_term1 = tdof * boltz * t_current;
-      mtk_term1 /= pdim * atom->natoms;
+      // mtk_term1 /= pdim * atom->natoms;
+      mtk_term1 /= tdof;  // experimental
     } else {
       double *mvv_current = temperature->vector;
       for (int i = 0; i < 3; i++)
@@ -2426,28 +3545,49 @@ void FixNH::nh_omega_dot()
 
   for (int i = 0; i < 3; i++)
     if (p_flag[i]) {
-      f_omega = (p_current[i]-p_hydro)*volume /
+      // printf("p_current[%d]: %.16e, p_hydro: %.16e\n", i, p_current[i], p_hydro);
+      f_omega[i] = (p_current[i]-p_hydro)*volume /
         (omega_mass[i] * nktv2p) + mtk_term1 / omega_mass[i];
-      if (deviatoric_flag) f_omega -= fdev[i]/(omega_mass[i] * nktv2p);
-      omega_dot[i] += f_omega*dthalf;
+      // printf("f_omega[%d] before deviatoric: %.16e\n", i, f_omega[i]);
+      if (deviatoric_flag) f_omega[i] -= fdev[i]/(omega_mass[i] * nktv2p);
+      if (big_omega_update_flag == 1 && pstyle == ISO) f_omega[i] *= 3; // added by me
+      omega_dot[i] += f_omega[i]*dthalf;
       omega_dot[i] *= pdrag_factor;
     }
+
+// // here I want to compute the force on omega with compute_f_omega and compare with the force I have in this function
+//   compute_f_omega();
+//   for (int i = 0; i < 3; i++) {
+//     if (p_flag[i]) {
+//       f_omega[i] = force_omega[i];
+//       double f_omega_current = (p_current[i]-p_hydro)*volume /
+//         (omega_mass[i] * nktv2p) + mtk_term1 / omega_mass[i];
+//       if (deviatoric_flag) f_omega_current -= fdev[i]/(omega_mass[i] * nktv2p);
+//       //print the difference anyway
+//       printf("f_omega[%d]: computed = %.16e, current = %.16e\n", i, f_omega[i], f_omega_current);
+//       if (std::abs(f_omega[i] - f_omega_current) > 1e-5) {
+//         error->warning(FLERR, fmt::format("Discrepancy in f_omega for component {}: computed {} vs current {}", i, f_omega[i], f_omega_current).c_str());
+//       }
+//     }
+//   }
+
 
   mtk_term2 = 0.0;
   if (mtk_flag) {
     for (int i = 0; i < 3; i++)
       if (p_flag[i])
         mtk_term2 += omega_dot[i];
-    if (pdim > 0) mtk_term2 /= pdim * atom->natoms;
+    // if (pdim > 0) mtk_term2 /= pdim * atom->natoms;  // the same implementation as mine
+    if (pdim > 0) mtk_term2 /= tdof;  // experimental
   }
 
   if (pstyle == TRICLINIC) {
     for (int i = 3; i < 6; i++) {
       if (p_flag[i]) {
-        f_omega = p_current[i]*volume/(omega_mass[i] * nktv2p);
+        f_omega[i] = p_current[i]*volume/(omega_mass[i] * nktv2p);
         if (deviatoric_flag)
-          f_omega -= fdev[i]/(omega_mass[i] * nktv2p);
-        omega_dot[i] += f_omega*dthalf;
+          f_omega[i] -= fdev[i]/(omega_mass[i] * nktv2p);
+        omega_dot[i] += f_omega[i]*dthalf;
         omega_dot[i] *= pdrag_factor;
       }
     }
@@ -2470,7 +3610,7 @@ void FixNH::nh_omega_dot()
     image flags to new values, making eqs in doc of Domain:image_flip incorrect
 ------------------------------------------------------------------------- */
 
-void FixNH::pre_exchange()
+void FixNHCon::pre_exchange()
 {
   double xprd = domain->xprd;
   double yprd = domain->yprd;
@@ -2534,12 +3674,68 @@ void FixNH::pre_exchange()
 }
 
 /* ----------------------------------------------------------------------
+   RATTLE velocity constraint helper: copy current v -> vp,
+   communicate, then apply Lagrange multiplier corrections to v
+   so that r_ij · v_ij = 0 for all constrained bonds.
+------------------------------------------------------------------------- */
+
+void FixNHCon::apply_rattle_velocity_constraints()
+{
+  if (!shake_flag || !vp || !list || nlist == 0) return;
+
+  double **v = atom->v;
+  int nlocal = atom->nlocal;
+
+  // copy current velocities into vp (unconstrained velocities)
+  for (int i = 0; i < nlocal; i++) {
+    if (shake_flag[i]) {
+      vp[i][0] = v[i][0];
+      vp[i][1] = v[i][1];
+      vp[i][2] = v[i][2];
+    } else {
+      vp[i][0] = vp[i][1] = vp[i][2] = 0;
+    }
+  }
+
+  // communicate vp across processors
+  if (comm->nprocs > 1) {
+    comm_mode = 1;                  // VP mode
+    comm->forward_comm(this);
+  }
+
+  // apply velocity corrections for each constrained molecule
+  for (int i = 0; i < nlist; i++) {
+    int m = list[i];
+    if (shake_flag[m] == 2)        vrattle2(m);
+    else if (shake_flag[m] == 3)    vrattle3(m);
+    else if (shake_flag[m] == 4)    vrattle4(m);
+    else                            vrattle3angle(m);
+  }
+}
+
+/* ----------------------------------------------------------------------
+   SHAKE position constraint helper: communicate current positions,
+   then call FixShake::post_force to enforce bond length constraints.
+------------------------------------------------------------------------- */
+
+void FixNHCon::apply_shake_position_constraints(int vflag)
+{
+  if (!shake_flag || !list || nlist == 0) return;
+
+  if (comm->nprocs > 1) {
+    comm_mode = 2;                  // XSHAKE mode
+    comm->forward_comm(this);
+  }
+  FixShake::post_force(vflag);
+}
+
+/* ----------------------------------------------------------------------
    memory usage of Irregular
 ------------------------------------------------------------------------- */
 
-double FixNH::memory_usage()
+double FixNHCon::memory_usage()
 {
-  double bytes = 0.0;
+  double bytes = FixRattle::memory_usage();
   if (irregular) bytes += irregular->memory_usage();
   return bytes;
 }
