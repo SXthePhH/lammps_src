@@ -1106,6 +1106,10 @@ void FixNHnew::initial_integrate_middle()
     for (int k = 0; k < 6; k++) virial[k] = 0.0;
   }
 
+  // B: half-step velocity update
+  nve_v();
+  if (pstat_flag) nh_v_press();
+
   if (pstat_flag) {
     if (pstyle == ISO) {
       temperature->compute_scalar();
@@ -1143,27 +1147,6 @@ void FixNHnew::initial_integrate_middle()
     if (nh_temp_flag == 1) nhc_temp_integrate();
     else if (nh_temp_flag == 0) langevin_temp();
   }
-
-  // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
-  // Only execute this when thermo output is active for this step
-  // this is because the momentum(velocity) distribution is accurate after applying the thermostat and barostat.
-  if (output->next_thermo == update->ntimestep) {
-    if (atom->nmax > nmax) {
-      nmax = atom->nmax;
-      // We reallocate both here since nmax tracks both
-      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
-      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-    }
-
-    double **v = atom->v;
-
-    int nlocal = atom->nlocal;
-    for (int i = 0; i < nlocal; i++) {
-        v_backup[i][0] = v[i][0];
-        v_backup[i][1] = v[i][1];
-        v_backup[i][2] = v[i][2];
-    }
-  }
   
   // A: full-step position update (second half)
   nve_x_half();
@@ -1196,6 +1179,26 @@ void FixNHnew::final_integrate_middle()
     pressure->addstep(update->ntimestep+1);
   }
 
+  // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
+  // Only execute this when thermo output is active for this step
+  if (output->next_thermo == update->ntimestep) {
+    if (atom->nmax > nmax) {
+      nmax = atom->nmax;
+      // We reallocate both here since nmax tracks both
+      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
+      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+    }
+
+    double **v = atom->v;
+
+    int nlocal = atom->nlocal;
+    for (int i = 0; i < nlocal; i++) {
+        v_backup[i][0] = v[i][0];
+        v_backup[i][1] = v[i][1];
+        v_backup[i][2] = v[i][2];
+    }
+  }
+
   // half-step barostat omega update using fresh P
   if (pstat_flag) {
     nh_omega_dot();
@@ -1203,10 +1206,6 @@ void FixNHnew::final_integrate_middle()
   }
 
   nve_v();
-  // B: half-step velocity update
-  nve_v();
-  if (pstat_flag) nh_v_press();
-
 }
 
 // the end_of_step of this fix has to be the last end_of_step called in the timestep.
