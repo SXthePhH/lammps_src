@@ -112,7 +112,7 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   omega_mass_corr = 0.0;
   tau_baro = 0.0;
   integrator = MIDDLE;
-  zero_flag = 0;
+  zero_flag = 1;
 
   scaleyz = scalexz = scalexy = 0;
   if (domain->yperiodic && domain->xy != 0.0) scalexy = 1;
