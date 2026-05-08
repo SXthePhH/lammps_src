@@ -8,7 +8,7 @@ Now we support two types of thermostat and barostat, which are "langevin" and "n
 
 You can also choose to use different integration order by keywords "integrator", where you can choose "middle" or "side", and we recommand you to use middle integrator which is numerically more stable.
 
-To remove the COM momentum when using langevin thermostat, you can use "zero_flag 0".
+To remove the COM momentum when using langevin thermostat, you can use "zero_flag 1".
 
 There are also some flags added, but might be removed afterwards. Which actually do not matter too much, just set them to be 0
 
@@ -16,6 +16,6 @@ There are also some flags added, but might be removed afterwards. Which actually
 example:
 if you want to use the middle integrator with langevin thermo/barostat then the fix command should be 
 
-fix 1 all npt/middle iso (press args) temp (temp args) integrator middle barostat langevin thermostat langevin
+fix 1 all npt/new iso (press args) temp (temp args) integrator middle barostat langevin thermostat langevin
 
 now the default is middle langevin 
