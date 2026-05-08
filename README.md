@@ -14,13 +14,8 @@ There are also some flags added, but might be removed afterwards. Which actually
 
 
 example:
-$$
-\begin{align}
- & \text{fix 1 all} \textcolor{red}{\text{ middle/new }} \& \\
- & \text{temp 299.5 299.5 432.9 }\& \\
- & \text{iso 705.423 705.423 4329.0 1000.0 2.4 }\& \\
- & \textcolor{red}{\text{thermostat langevin }}\& \\
- & \textcolor{red}{\text{barostat nh }} \& \\
- & \text{big\_mass 1 big\_update 1}
-\end{align}
-$$
+if you want to use the middle integrator with langevin thermo/barostat then the fix command should be 
+
+fix 1 all npt/middle iso (press args) temp (temp args) integrator middle barostat langevin thermostat langevin
+
+now the default is middle langevin 
