@@ -64,8 +64,8 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
-  nh_temp_flag = 0;
-  nh_press_flag = 0;
+  nh_temp_flag = 0; // defalut use langevin 
+  nh_press_flag = 0; // defalut use langevin 
   big_mass_flag = 0;
   big_omega_update_flag = 0;
 
@@ -111,7 +111,7 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   gamma_t = gamma_p = 0.0;
   omega_mass_corr = 0.0;
   tau_baro = 0.0;
-  integrator = SIDE;
+  integrator = MIDDLE;
   zero_flag = 0;
 
   scaleyz = scalexz = scalexy = 0;
