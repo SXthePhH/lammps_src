@@ -31,6 +31,7 @@
 #include "memory.h"
 #include "modify.h"
 #include "neighbor.h"
+#include "thermo.h"
 #include "respa.h"
 #include "update.h"
 #include "random_mars.h"
@@ -60,7 +61,8 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), id_dilate(nullptr), irregular(nullptr), step_respa(nullptr), id_temp(nullptr),
     id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
   etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr),
-  v_storage(nullptr), v_backup(nullptr), v_stored(0), nmax(0)
+  id_temp_snapshot(nullptr), temperature_snapshot(nullptr), tsnapshotflag(0),
+  v_backup(nullptr), nmax(0)
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
@@ -101,6 +103,7 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
 
   tcomputeflag = 0;
   pcomputeflag = 0;
+  tsnapshotflag = 0;
 
   // turn on tilt factor scaling, whenever applicable
 
@@ -676,13 +679,15 @@ FixNHnew::~FixNHnew()
 
   delete[] id_dilate;
   delete irregular;
-  memory->destroy(v_storage);
   memory->destroy(v_backup);
 
   // delete temperature and pressure if fix created them
 
   if (tcomputeflag) modify->delete_compute(id_temp);
   delete[] id_temp;
+
+  if (tsnapshotflag) modify->delete_compute(id_temp_snapshot);
+  delete[] id_temp_snapshot;
 
   if (tstat_flag) {
     delete[] eta;
@@ -761,6 +766,31 @@ void FixNHnew::init()
       error->all(FLERR,"Pressure compute ID {} for fix {} does not exist", id_press, style);
     if (pressure->pressflag == 0)
       error->all(FLERR,"Compute ID {} for fix {} does not compute pressure", id_press, style);
+  }
+
+  if (integrator == MIDDLE) {
+    if (!tsnapshotflag) {
+      id_temp_snapshot = utils::strdup(std::string(id) + std::string("_temp_snapshot"));
+      temperature_snapshot = modify->add_compute(
+          fmt::format("{} all temp/fixbackup {}", id_temp_snapshot, id));
+      tsnapshotflag = 1;
+    } else {
+      temperature_snapshot = modify->get_compute_by_id(id_temp_snapshot);
+    }
+
+    if (!temperature_snapshot)
+      error->all(FLERR, "Snapshot temperature compute ID {} for fix {} does not exist",
+                 id_temp_snapshot, style);
+    if (temperature_snapshot->tempflag == 0)
+      error->all(FLERR, "Compute ID {} for fix {} does not compute a temperature",
+                 id_temp_snapshot, style);
+
+    if (output && output->thermo && output->thermo->modified == 0) {
+      char *arg_temp[2];
+      arg_temp[0] = const_cast<char *>("temp");
+      arg_temp[1] = id_temp_snapshot;
+      output->thermo->modify_params(2, arg_temp);
+    }
   }
 
   // set timesteps and frequencies
@@ -1088,28 +1118,6 @@ void FixNHnew::final_integrate()
 
 void FixNHnew::initial_integrate_middle()
 {
-  // If we hacked the velocities at end_of_step (for thermo output to match t_initial),
-  // we MUST restore them now before any physics happens!
-  if (v_stored) {
-    if (!v_storage) error->one(FLERR, "FixNPTLangevin: v_storage missing!");
-    
-    double **v = atom->v;
-    int nlocal = atom->nlocal;
-    for (int i = 0; i < nlocal; i++) {
-        v[i][0] = v_storage[i][0];
-        v[i][1] = v_storage[i][1];
-        v[i][2] = v_storage[i][2];
-    }
-    v_stored = 0;
-    
-    // Also clear the fake virial contribution we added for thermo
-    for (int k = 0; k < 6; k++) virial[k] = 0.0;
-  }
-
-  // B: half-step velocity update
-  nve_v();
-  if (pstat_flag) nh_v_press();
-
   if (pstat_flag) {
     if (pstyle == ISO) {
       temperature->compute_scalar();
@@ -1141,13 +1149,25 @@ void FixNHnew::initial_integrate_middle()
     else if (nh_press_flag == 0) langevin_press();
   }
 
+  double **v = atom->v;
+  int nlocal = atom->nlocal;
+  if (nlocal > nmax) {
+    nmax = nlocal;
+    memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+  }
+  for (int i = 0; i < nlocal; i++) {
+    v_backup[i][0] = v[i][0];
+    v_backup[i][1] = v[i][1];
+    v_backup[i][2] = v[i][2];
+  }
+
 
   if (tstat_flag) {
     compute_temp_target();
     if (nh_temp_flag == 1) nhc_temp_integrate();
     else if (nh_temp_flag == 0) langevin_temp();
   }
-  
+
   // A: full-step position update (second half)
   nve_x_half();
   // A: half-step box remap (second half)
@@ -1160,6 +1180,7 @@ void FixNHnew::initial_integrate_middle()
 
 void FixNHnew::final_integrate_middle()
 {
+
   // measure fresh T and P from newly computed forces (Physics requires this!)
 
   t_current = temperature->compute_scalar();
@@ -1179,82 +1200,21 @@ void FixNHnew::final_integrate_middle()
     pressure->addstep(update->ntimestep+1);
   }
 
-  // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
-  // Only execute this when thermo output is active for this step
-  if (output->next_thermo == update->ntimestep) {
-    if (atom->nmax > nmax) {
-      nmax = atom->nmax;
-      // We reallocate both here since nmax tracks both
-      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
-      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-    }
-
-    double **v = atom->v;
-
-    int nlocal = atom->nlocal;
-    for (int i = 0; i < nlocal; i++) {
-        v_backup[i][0] = v[i][0];
-        v_backup[i][1] = v[i][1];
-        v_backup[i][2] = v[i][2];
-    }
-  }
-
   // half-step barostat omega update using fresh P
   if (pstat_flag) {
     nh_omega_dot();
     nh_v_press();
   }
-
   nve_v();
+  // B: half-step velocity update
+  nve_v();
+  if (pstat_flag) nh_v_press();
 }
 
 // the end_of_step of this fix has to be the last end_of_step called in the timestep.
 
 void FixNHnew::end_of_step()
 {
-  // "Output Hack" Revised:
-  // To satisfy the requirement of recording correct "internal distribution" and "virial data"
-  // corresponding to the beginning of final_integrate, we physically restore the velocity state v(t+dt/2).
-  // 
-  // 1. Save current v(t+dt) to v_storage (to be restored in next initial_integrate).
-  // 2. Overwrite v with v_backup (v(t+dt/2)).
-  // 3. Do NOT modify virial manually; the position/force state is identical to start of final_integrate,
-  //    so ComputePressure will yield the correct virial contribution automatically.
-  
-  if (output->next_thermo == update->ntimestep) {
-    if (atom->nmax > nmax) {
-      nmax = atom->nmax;
-      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
-      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-    }
-  
-    double **v = atom->v;
-    int nlocal = atom->nlocal;
-  
-    // 1. Save valid v(t+dt)
-    for (int i=0; i<nlocal; i++) {
-        v_storage[i][0] = v[i][0];
-        v_storage[i][1] = v[i][1];
-        v_storage[i][2] = v[i][2];
-    }
-    v_stored = 1;
-
-    // 2. Restore v(t+dt/2)
-    if (v_backup) {
-        for (int i=0; i<nlocal; i++) {
-           v[i][0] = v_backup[i][0];
-           v[i][1] = v_backup[i][1];
-           v[i][2] = v_backup[i][2];
-        }
-    }
-  }
-
-  // Force re-computation of Temperature/Pressure?
-  // Thermo will ask for these.
-  // If thermo uses a distinct compute, it will calculate from current v (which is now v_backup) -> Correct.
-  // If thermo uses fix's compute, it might use cached value from start of final_integrate -> Correct.
-  // We can force clear the cache to be safe, but LAMMPS API doesn't easily support "un-invoking".
-  // However, since we matched the state, the cached value is consistent with current state anyway.
 }
 /* ----------------------------------------------------------------------
    Langevin thermostat O-step on particle velocities.
@@ -2608,6 +2568,9 @@ void *FixNHnew::extract(const char *str, int &dim)
     return &mpchain;
   }
   dim=1;
+  if (strcmp(str,"v_backup") == 0) {
+    return &v_backup;
+  }
   if (tstat_flag && strcmp(str,"eta") == 0) {
     return &eta;
   } else if (pstat_flag && strcmp(str,"etap") == 0) {

@@ -85,6 +85,10 @@ class FixNHnew : public Fix {
   int tcomputeflag, pcomputeflag;    // 1 = compute was created by fix
                                      // 0 = created externally
 
+  char *id_temp_snapshot;
+  class Compute *temperature_snapshot;
+  int tsnapshotflag;
+
   double *eta, *eta_dot;    // chain thermostat for particles
   double *eta_dotdot;
   double *eta_mass;
@@ -139,9 +143,7 @@ class FixNHnew : public Fix {
   double omega_mass_corr, tau_baro;
   class RanMars *random;
   int seed;
-   double **v_storage;
-   double **v_backup;
-   int v_stored;
+  double **v_backup;
    int nmax;
 
   void couple();
