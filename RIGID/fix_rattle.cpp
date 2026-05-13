@@ -60,32 +60,16 @@ FixRattle::FixRattle(LAMMPS *lmp, int narg, char **arg) :
   rattle = 1;
 
   // allocate memory for unconstrained velocity update
-  // FixShake::grow_arrays was called in base constructor with rattle=0,
-  // so call again with rattle=1 to allocate vp
 
   vp = nullptr;
-  FixShake::grow_arrays(atom->nmax);
+  FixRattle::grow_arrays(atom->nmax);
+
+  // default communication mode
+  // necessary for compatibility with SHAKE
+  // see pack_forward and unpack_forward
 
   comm_mode = XSHAKE;
-
-  verr_max = 0;
-  derr_max = 0;
-}
-
-/* ----------------------------------------------------------------------
-   Protected constructor for wrapper classes (e.g. fix nh new).
-   Calls the no-arg-parsing FixShake constructor.
-------------------------------------------------------------------------- */
-
-FixRattle::FixRattle(LAMMPS *lmp, int narg, char **arg, int dummy) :
-    FixShake(lmp, narg, arg, dummy)
-{
-  rattle = 1;
-
-  vp = nullptr;
-  FixShake::grow_arrays(atom->nmax);
-
-  comm_mode = XSHAKE;
+  vflag_post_force = 0;
 
   verr_max = 0;
   derr_max = 0;
@@ -95,7 +79,7 @@ FixRattle::FixRattle(LAMMPS *lmp, int narg, char **arg, int dummy) :
 
 FixRattle::~FixRattle()
 {
-  // vp is now destroyed by FixShake::~FixShake
+  memory->destroy(vp);
 
 #if RATTLE_DEBUG
 
@@ -127,7 +111,9 @@ int FixRattle::setmask()
   mask |= FINAL_INTEGRATE;
   mask |= FINAL_INTEGRATE_RESPA;
   mask |= MIN_POST_FORCE;
+#if RATTLE_DEBUG
   mask |= END_OF_STEP;
+#endif
   return mask;
 }
 
@@ -161,6 +147,8 @@ void FixRattle::init() {
 
 void FixRattle::post_force(int vflag)
 {
+  if (external_constraints) return;
+
   // remember vflag for the coordinate correction in this->final_integrate
 
   vflag_post_force = vflag;
@@ -193,6 +181,8 @@ void FixRattle::post_force(int vflag)
 
 void FixRattle::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 {
+  if (external_constraints) return;
+
   // remember vflag for the coordinate correction in this->final_integrate
 
   vflag_post_force = vflag;
@@ -227,6 +217,8 @@ void FixRattle::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 
 void FixRattle::final_integrate()
 {
+  if (external_constraints) return;
+
   comm_mode = XSHAKE;
   FixShake::post_force(vflag_post_force);
 }
@@ -235,8 +227,360 @@ void FixRattle::final_integrate()
 
 void FixRattle::final_integrate_respa(int ilevel, int iloop)
 {
+  if (external_constraints) return;
+
   comm_mode = XSHAKE;
   FixShake::post_force_respa(vflag_post_force, ilevel, iloop);
+}
+
+/* ----------------------------------------------------------------------
+   correct velocities of molecule m with 2 constraints bonds and 1 angle
+------------------------------------------------------------------------- */
+
+void FixRattle::vrattle3angle(int m)
+{
+  tagint i0,i1,i2;
+  double c[3], l[3], a[3][3], r01[3], imass[3],
+         r02[3], r12[3], vp01[3], vp02[3], vp12[3];
+
+  // local atom IDs and constraint distances
+
+  i0 = atom->map(shake_atom[m][0]);
+  i1 = atom->map(shake_atom[m][1]);
+  i2 = atom->map(shake_atom[m][2]);
+
+  // r01,r02,r12 = distance vec between atoms
+
+  MathExtra::sub3(x[i1],x[i0],r01);
+  MathExtra::sub3(x[i2],x[i0],r02);
+  MathExtra::sub3(x[i2],x[i1],r12);
+
+  // take into account periodicity
+
+  domain->minimum_image(FLERR, r01);
+  domain->minimum_image(FLERR, r02);
+  domain->minimum_image(FLERR, r12);
+
+  // v01,v02,v12 = velocity differences
+
+  MathExtra::sub3(vp[i1],vp[i0],vp01);
+  MathExtra::sub3(vp[i2],vp[i0],vp02);
+  MathExtra::sub3(vp[i2],vp[i1],vp12);
+
+  // matrix coeffs and rhs for lamda equations
+
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+    imass[2] = 1.0 / rmass[i2];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+    imass[2] = 1.0 / mass[type[i2]];
+  }
+
+  // setup matrix
+
+  a[0][0]   =   (imass[1] + imass[0])   * MathExtra::dot3(r01,r01);
+  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
+  a[0][2]   =   (-imass[1]          )   * MathExtra::dot3(r01,r12);
+  a[1][0]   =   a[0][1];
+  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
+  a[1][2]   =   (imass[2]           )   * MathExtra::dot3(r02,r12);
+  a[2][0]   =   a[0][2];
+  a[2][1]   =   a[1][2];
+  a[2][2]   =   (imass[2] + imass[1])   * MathExtra::dot3(r12,r12);
+
+  // sestup RHS
+
+  c[0]  = -MathExtra::dot3(vp01,r01);
+  c[1]  = -MathExtra::dot3(vp02,r02);
+  c[2]  = -MathExtra::dot3(vp12,r12);
+
+  // calculate the inverse matrix exactly
+
+  solve3x3exactly(a,c,l);
+
+  // add corrections to the velocities if processor owns atom
+
+  if (i0 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i0][k]  -=  imass[0]*  (  l[0] * r01[k] + l[1] * r02[k] );
+  }
+  if (i1 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i1][k]  -=  imass[1] * ( -l[0] * r01[k] + l[2] * r12[k] );
+  }
+  if (i2 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i2][k] -=   imass[2] * ( -l[1] * r02[k] - l[2] * r12[k] );
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::vrattle2(int m)
+{
+  tagint    i0, i1;
+  double    imass[2], r01[3], vp01[3];
+
+  // local atom IDs and constraint distances
+
+  i0 = atom->map(shake_atom[m][0]);
+  i1 = atom->map(shake_atom[m][1]);
+
+  // r01 = distance vec between atoms, with PBC
+
+  MathExtra::sub3(x[i1],x[i0],r01);
+  domain->minimum_image(FLERR, r01);
+
+  // v01 = distance vectors for velocities
+
+  MathExtra::sub3(vp[i1],vp[i0],vp01);
+
+  // matrix coeffs and rhs for lamda equations
+
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+  }
+
+  // Lagrange multiplier: exact solution
+
+  double l01 = - MathExtra::dot3(r01,vp01) /
+    (MathExtra::dot3(r01,r01) * (imass[0] + imass[1]));
+
+  // add corrections to the velocities if the process owns this atom
+
+  if (i0 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i0][k] -= imass[0] * l01 * r01[k];
+  }
+  if (i1 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i1][k] -= imass[1] * (-l01) * r01[k];
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::vrattle3(int m)
+{
+  tagint    i0,i1,i2;
+  double    imass[3], r01[3], r02[3], vp01[3], vp02[3],
+            a[2][2],c[2],l[2];
+
+  // local atom IDs and constraint distances
+
+  i0 = atom->map(shake_atom[m][0]);
+  i1 = atom->map(shake_atom[m][1]);
+  i2 = atom->map(shake_atom[m][2]);
+
+  // r01,r02 = distance vec between atoms, with PBC
+
+  MathExtra::sub3(x[i1],x[i0],r01);
+  MathExtra::sub3(x[i2],x[i0],r02);
+
+  domain->minimum_image(FLERR, r01);
+  domain->minimum_image(FLERR, r02);
+
+  // vp01,vp02 =  distance vectors between velocities
+
+  MathExtra::sub3(vp[i1],vp[i0],vp01);
+  MathExtra::sub3(vp[i2],vp[i0],vp02);
+
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+    imass[2] = 1.0 / rmass[i2];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+    imass[2] = 1.0 / mass[type[i2]];
+  }
+
+  // setup matrix
+
+  a[0][0]   =   (imass[1] + imass[0])   * MathExtra::dot3(r01,r01);
+  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
+  a[1][0]   =   a[0][1];
+  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
+
+  // setup RHS
+
+  c[0]  = - MathExtra::dot3(vp01,r01);
+  c[1]  = - MathExtra::dot3(vp02,r02);
+
+  // calculate the inverse 2x2 matrix exactly
+
+  solve2x2exactly(a,c,l);
+
+  // add corrections to the velocities if the process owns this atom
+
+  if (i0 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i0][k] -= imass[0] * (  l[0] * r01[k] + l[1] * r02[k] );
+  }
+  if (i1 < nlocal)
+    for (int k=0; k<3; k++) {
+      v[i1][k] -= imass[1] * ( -l[0] * r01[k] );
+  }
+  if (i2 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i2][k] -= imass[2] * ( -l[1] * r02[k] );
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::vrattle4(int m)
+{
+  tagint    i0,i1,i2,i3;
+  double    imass[4], c[3], l[3], a[3][3],
+            r01[3], r02[3], r03[3], vp01[3], vp02[3], vp03[3];
+
+  // local atom IDs and constraint distances
+
+  i0 = atom->map(shake_atom[m][0]);
+  i1 = atom->map(shake_atom[m][1]);
+  i2 = atom->map(shake_atom[m][2]);
+  i3 = atom->map(shake_atom[m][3]);
+
+  // r01,r02,r12 = distance vec between atoms, with PBC
+
+  MathExtra::sub3(x[i1],x[i0],r01);
+  MathExtra::sub3(x[i2],x[i0],r02);
+  MathExtra::sub3(x[i3],x[i0],r03);
+
+  domain->minimum_image(FLERR, r01);
+  domain->minimum_image(FLERR, r02);
+  domain->minimum_image(FLERR, r03);
+
+  // vp01,vp02,vp03 = distance vectors between velocities
+
+  MathExtra::sub3(vp[i1],vp[i0],vp01);
+  MathExtra::sub3(vp[i2],vp[i0],vp02);
+  MathExtra::sub3(vp[i3],vp[i0],vp03);
+
+  // matrix coeffs and rhs for lamda equations
+
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+    imass[2] = 1.0 / rmass[i2];
+    imass[3] = 1.0 / rmass[i3];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+    imass[2] = 1.0 / mass[type[i2]];
+    imass[3] = 1.0 / mass[type[i3]];
+  }
+
+  // setup matrix
+
+  a[0][0]   =   (imass[0] + imass[1])   * MathExtra::dot3(r01,r01);
+  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
+  a[0][2]   =   (imass[0]           )   * MathExtra::dot3(r01,r03);
+  a[1][0]   =   a[0][1];
+  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
+  a[1][2]   =   (imass[0]           )   * MathExtra::dot3(r02,r03);
+  a[2][0]   =   a[0][2];
+  a[2][1]   =   a[1][2];
+  a[2][2]   =   (imass[0] + imass[3])   * MathExtra::dot3(r03,r03);
+
+  // setup RHS
+
+  c[0]  = - MathExtra::dot3(vp01,r01);
+  c[1]  = - MathExtra::dot3(vp02,r02);
+  c[2]  = - MathExtra::dot3(vp03,r03);
+
+  // calculate the inverse 3x3 matrix exactly
+
+  solve3x3exactly(a,c,l);
+
+  // add corrections to the velocities if the process owns this atom
+
+  if (i0 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i0][k] -= imass[0] * (  l[0] * r01[k] + l[1] * r02[k] + l[2] * r03[k]);
+  }
+  if (i1 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i1][k] -= imass[1] * (-l[0] * r01[k]);
+  }
+  if (i2 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i2][k] -= imass[2] * ( -l[1] * r02[k]);
+  }
+  if (i3 < nlocal) {
+    for (int k=0; k<3; k++)
+      v[i3][k] -= imass[3] * ( -l[2] * r03[k]);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::solve2x2exactly(const double a[][2],
+                                const double c[], double l[])
+{
+  double determ, determinv;
+
+  // calculate the determinant of the matrix
+
+  determ = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+
+  // check if matrix is actually invertible
+
+  if (determ == 0.0) error->one(FLERR,"Rattle determinant = 0.0");
+  determinv = 1.0/determ;
+
+  // Calculate the solution:  (l01, l02)^T = A^(-1) * c
+
+  l[0] = determinv * ( a[1][1] * c[0]  - a[0][1] * c[1]);
+  l[1] = determinv * (-a[1][0] * c[0]  + a[0][0] * c[1]);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::solve3x3exactly(const double a[][3],
+                                const double c[], double l[])
+{
+  double ai[3][3];
+  double determ, determinv;
+
+  // calculate the determinant of the matrix
+
+  determ = a[0][0]*a[1][1]*a[2][2] + a[0][1]*a[1][2]*a[2][0] +
+    a[0][2]*a[1][0]*a[2][1] - a[0][0]*a[1][2]*a[2][1] -
+    a[0][1]*a[1][0]*a[2][2] - a[0][2]*a[1][1]*a[2][0];
+
+  // check if matrix is actually invertible
+
+  if (determ == 0.0) error->one(FLERR,"Rattle determinant = 0.0");
+
+  // calculate the inverse 3x3 matrix: A^(-1) = (ai_jk)
+
+  determinv = 1.0/determ;
+  ai[0][0] =  determinv * (a[1][1]*a[2][2] - a[1][2]*a[2][1]);
+  ai[0][1] = -determinv * (a[0][1]*a[2][2] - a[0][2]*a[2][1]);
+  ai[0][2] =  determinv * (a[0][1]*a[1][2] - a[0][2]*a[1][1]);
+  ai[1][0] = -determinv * (a[1][0]*a[2][2] - a[1][2]*a[2][0]);
+  ai[1][1] =  determinv * (a[0][0]*a[2][2] - a[0][2]*a[2][0]);
+  ai[1][2] = -determinv * (a[0][0]*a[1][2] - a[0][2]*a[1][0]);
+  ai[2][0] =  determinv * (a[1][0]*a[2][1] - a[1][1]*a[2][0]);
+  ai[2][1] = -determinv * (a[0][0]*a[2][1] - a[0][1]*a[2][0]);
+  ai[2][2] =  determinv * (a[0][0]*a[1][1] - a[0][1]*a[1][0]);
+
+  // calculate the solution:  (l01, l02, l12)^T = A^(-1) * c
+
+  for (int i=0; i<3; i++) {
+    l[i] = 0;
+    for (int j=0; j<3; j++)
+      l[i] += ai[i][j] * c[j];
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -289,6 +633,94 @@ void FixRattle::update_v_half_nocons_respa(int /*ilevel*/)
 }
 
 /* ----------------------------------------------------------------------
+   memory usage of local atom-based arrays
+------------------------------------------------------------------------- */
+
+double FixRattle::memory_usage()
+{
+  int nmax = atom->nmax;
+  double bytes = FixShake::memory_usage();
+  bytes += (double)nmax*3 * sizeof(double);
+  return bytes;
+}
+
+/* ----------------------------------------------------------------------
+   allocate local atom-based arrays
+------------------------------------------------------------------------- */
+
+void FixRattle::grow_arrays(int nmax)
+{
+  FixShake::grow_arrays(nmax);
+  memory->destroy(vp);
+  memory->create(vp,nmax,3,"rattle:vp");
+}
+
+/* ---------------------------------------------------------------------- */
+
+int FixRattle::pack_forward_comm(int n, int *list, double *buf,
+                                 int pbc_flag, int *pbc)
+{
+  int i,j,m;
+  m = 0;
+
+  switch (comm_mode) {
+    case XSHAKE:
+      m = FixShake::pack_forward_comm(n, list, buf, pbc_flag, pbc);
+      break;
+    case VP:
+      for (i = 0; i < n; i++) {
+        j = list[i];
+        buf[m++] = vp[j][0];
+        buf[m++] = vp[j][1];
+        buf[m++] = vp[j][2];
+      }
+      break;
+
+    case V:
+      for (i = 0; i < n; i++) {
+        j = list[i];
+        buf[m++] = v[j][0];
+        buf[m++] = v[j][1];
+        buf[m++] = v[j][2];
+      }
+      break;
+  }
+  return m;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void FixRattle::unpack_forward_comm(int n, int first, double *buf)
+{
+  int i, m, last;
+  m = 0;
+  last = first + n;
+
+  switch (comm_mode) {
+    case XSHAKE:
+      FixShake::unpack_forward_comm(n, first,buf);
+      break;
+
+    case VP:
+      for (i = first; i < last; i++) {
+        vp[i][0] = buf[m++];
+        vp[i][1] = buf[m++];
+        vp[i][2] = buf[m++];
+      }
+      break;
+
+    case V:
+      for (i = first; i < last; i++) {
+        v[i][0] = buf[m++];
+        v[i][1] = buf[m++];
+        v[i][2] = buf[m++];
+      }
+      break;
+  }
+}
+
+
+/* ----------------------------------------------------------------------
   Let shake calculate new constraining forces for the coordinates;
   As opposed to the regular shake call, this method is usually called from
   end_of_step fixes after the second velocity integration has happened.
@@ -316,23 +748,64 @@ void FixRattle::correct_coordinates(int vflag) {
   FixShake::correct_coordinates(vflag);
 }
 
+void FixRattle::correct_coordinates_middle(int vflag, double **x_reference) {
+  comm_mode = XSHAKE;
+  FixShake::correct_coordinates_middle(vflag, x_reference);
+}
+
 /* ----------------------------------------------------------------------
-   Apply RATTLE velocity constraint at end of timestep:
-   remove velocity components along constrained bonds.
-   Debug checks are performed if RATTLE_DEBUG / RATTLE_RAISE_ERROR are on.
+   Remove the velocity component along any bond.
+------------------------------------------------------------------------- */
+
+void FixRattle::correct_velocities() {
+
+  // Copy current velocities instead of unconstrained_update, because the correction
+  // should happen instantaneously and not after the next half step.
+
+  for (int i = 0; i < atom->nlocal; i++) {
+    if (shake_flag[i]) {
+      for (int k=0; k<3; k++)
+        vp[i][k] = v[i][k];
+    }
+    else
+      vp[i][0] = vp[i][1] = vp[i][2] = 0;
+  }
+
+  // communicate the unconstrained velocities
+
+  if (comm->nprocs > 1) {
+    comm_mode = VP;
+    comm->forward_comm(this);
+  }
+
+  // correct the velocity for each molecule accordingly
+
+  int m;
+  for (int i = 0; i < nlist; i++) {
+    m = list[i];
+    if      (shake_flag[m] == 2)  vrattle2(m);
+    else if (shake_flag[m] == 3)  vrattle3(m);
+    else if (shake_flag[m] == 4)  vrattle4(m);
+    else                          vrattle3angle(m);
+  }
+}
+
+/* ----------------------------------------------------------------------
+   DEBUGGING methods
+   The functions below allow you to check whether the
+     coordinate and velocity constraints are satisfied at the
+     end of the timestep
+   only enabled if RATTLE_DEBUG is set to 1 at top of file
+   checkX tests if shakeX and vrattleX worked as expected
 ------------------------------------------------------------------------- */
 
 void FixRattle::end_of_step()
 {
-  // apply velocity constraint
-  correct_velocities();
-
-  // debug checks
-#if RATTLE_RAISE_ERROR
   if (comm->nprocs > 1) {
     comm_mode = V;
     comm->forward_comm(this);
   }
+#if RATTLE_RAISE_ERROR
   if (!check_constraints(v, RATTLE_TEST_POS, RATTLE_TEST_VEL))
     error->one(FLERR, "Rattle failed ");
 #endif

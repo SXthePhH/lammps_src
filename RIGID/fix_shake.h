@@ -31,11 +31,6 @@ class FixShake : public Fix {
  public:
   FixShake(class LAMMPS *, int, char **);
   ~FixShake() override;
-
-  // extra protected constructor for wrapper classes (e.g. fix nh new + rattle)
-  // Arg parsing skipped - the derived class is expected to do its own parsing
- protected:
-  FixShake(class LAMMPS *, int, char **, int);
   int setmask() override;
   void init() override;
   void setup(int) override;
@@ -59,8 +54,10 @@ class FixShake : public Fix {
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
 
+  void set_external_constraints(int);
   virtual void shake_end_of_step(int vflag);
   virtual void correct_coordinates(int vflag);
+  virtual void correct_coordinates_middle(int vflag, double **x_reference);
   virtual void correct_velocities();
 
   bigint dof(int) override;
@@ -71,6 +68,8 @@ class FixShake : public Fix {
  protected:
   int vflag_post_force;     // store the vflag of last post_force call
   int eflag_pre_reverse;    // store the eflag of last pre_reverse call
+  int external_constraints;  // 1 if another integrator drives projection constraints
+  int internal_constraint_call;
   int respa;                // 0 = vel. Verlet, 1 = respa
   int rattle;               // 0 = SHAKE, 1 = RATTLE
   double tolerance;         // SHAKE tolerance
@@ -114,10 +113,10 @@ class FixShake : public Fix {
   int **shake_type;       // bondtype of each bond in cluster
                           // for angle cluster, 3rd value
                           //   is angletype
-  double **vp;            // unconstrained velocities (RATTLE)
-  int comm_mode;          // mode for communication pack/unpack
   double **xshake;        // unconstrained atom coords
+  double **xref;          // reference coords for external middle constraints
   int *nshake;            // count
+  int comm_mode;          // mode for communication pack/unpack
 
   double dtv, dtfsq;                  // timesteps for trial move
   double dtf_inner, dtf_innerhalf;    // timesteps for rRESPA trial move
@@ -152,10 +151,10 @@ class FixShake : public Fix {
   void shake4(int);
   void shake3angle(int);
   double bond_force(int, int, double);
-  virtual void vrattle2(int m);
-  virtual void vrattle3(int m);
-  virtual void vrattle4(int m);
-  virtual void vrattle3angle(int m);
+  void velocity_shake(int);
+  void velocity_shake3(int);
+  void velocity_shake4(int);
+  void velocity_shake3angle(int);
   void solve3x3exactly(const double a[][3], const double c[], double l[]);
   void solve2x2exactly(const double a[][2], const double c[], double l[]);
   virtual void stats();

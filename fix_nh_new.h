@@ -26,6 +26,8 @@ class FixNHnew : public Fix {
   void init() override;
   void setup(int) override;
   void initial_integrate(int) override;
+  void post_integrate() override;
+  void pre_force(int) override;
   void final_integrate() override;
   void initial_integrate_respa(int, int, int) override;
   void pre_force_respa(int, int, int) override;
@@ -42,7 +44,11 @@ class FixNHnew : public Fix {
   void reset_dt() override;
   void *extract(const char *, int &) override;
   double memory_usage() override;
-   void initial_integrate_middle();
+  void grow_arrays(int) override;
+  void copy_arrays(int, int, int) override;
+  int pack_exchange(int, double *) override;
+  int unpack_exchange(int, double *) override;
+   void initial_integrate_middle(int);
    void final_integrate_middle();
 
  protected:
@@ -144,7 +150,10 @@ class FixNHnew : public Fix {
   class RanMars *random;
   int seed;
   double **v_backup;
+  double **x_reference;
    int nmax;
+  int constrain_flag;
+  class FixShake *constraint_fix;
 
   void couple();
   virtual void remap();
@@ -173,7 +182,10 @@ class FixNHnew : public Fix {
   double omegadot_exp[6];
   void mat_exp(double delta_t, const double *mat);
   void remap_me();
+  void save_constraint_reference_positions();
   void scale_v();
+  void constrain_positions(int);
+  void constrain_velocities();
   void nhc_press_integrate_me();
   void nhc_press_integrate_iso();
   void end_of_step();

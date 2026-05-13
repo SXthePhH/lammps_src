@@ -24,6 +24,7 @@
 #include "domain.h"
 #include "error.h"
 #include "fix_deform.h"
+#include "RIGID/fix_shake.h"
 #include "force.h"
 #include "group.h"
 #include "irregular.h"
@@ -62,7 +63,7 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
     id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
   etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr),
   id_temp_snapshot(nullptr), temperature_snapshot(nullptr), tsnapshotflag(0),
-  v_backup(nullptr), nmax(0)
+  v_backup(nullptr), x_reference(nullptr), nmax(0)
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
@@ -70,6 +71,8 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   nh_press_flag = 0; // defalut use langevin 
   big_mass_flag = 0;
   big_omega_update_flag = 0;
+  constrain_flag = 0;
+  constraint_fix = nullptr;
 
   restart_global = 1;
   dynamic_group_allow = 1;
@@ -451,6 +454,10 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
       zero_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
       iarg += 2;
 
+    } else if (strcmp(arg[iarg], "constrain") == 0) {
+      constrain_flag = 1;
+      iarg += 1;
+
     }else error->all(FLERR,"Unknown fix {} keyword: {}", style, arg[iarg]);
   }
 
@@ -668,6 +675,11 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   gamma_t = 1.0 / damp_t;
   gamma_p = 1.0 / damp_p;
   random = new RanMars(lmp,seed);
+
+  if (integrator == MIDDLE) {
+    grow_arrays(atom->nmax);
+    atom->add_callback(Atom::GROW);
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -679,7 +691,9 @@ FixNHnew::~FixNHnew()
 
   delete[] id_dilate;
   delete irregular;
+  if (integrator == MIDDLE && modify->get_fix_by_id(id)) atom->delete_callback(id, Atom::GROW);
   memory->destroy(v_backup);
+  memory->destroy(x_reference);
 
   // delete temperature and pressure if fix created them
 
@@ -719,6 +733,7 @@ int FixNHnew::setmask()
   mask |= FINAL_INTEGRATE_RESPA;
   mask |= PRE_FORCE_RESPA;
   if (integrator == MIDDLE) mask |= END_OF_STEP;
+  if (integrator == MIDDLE && constrain_flag) mask |= POST_INTEGRATE;
   if (pre_exchange_flag) mask |= PRE_EXCHANGE;
   return mask;
 }
@@ -747,6 +762,27 @@ void FixNHnew::init()
       }
     }
 
+  constraint_fix = nullptr;
+  if (constrain_flag) {
+    if (integrator != MIDDLE)
+      error->all(FLERR, "Fix {} constrain keyword requires integrator middle", style);
+
+    int nconstraint = 0;
+    for (int i = 0; i < modify->nfix; i++) {
+      if (strcmp(modify->fix[i]->style, "shake") == 0 ||
+          strcmp(modify->fix[i]->style, "rattle") == 0) {
+        constraint_fix = dynamic_cast<FixShake *>(modify->fix[i]);
+        nconstraint++;
+      }
+    }
+
+    if (nconstraint == 0)
+      error->all(FLERR, "Fix {} constrain keyword requires a fix shake or fix rattle", style);
+    if (nconstraint > 1)
+      error->all(FLERR, "Fix {} constrain keyword found multiple fix shake/rattle instances", style);
+    if (constraint_fix) constraint_fix->set_external_constraints(1);
+  }
+
   // set temperature and pressure ptrs
 
   temperature = modify->get_compute_by_id(id_temp);
@@ -758,8 +794,6 @@ void FixNHnew::init()
     if (temperature->tempbias) which = BIAS;
     else which = NOBIAS;
   }
-  printf("which = %d\n", which);
-
   if (pstat_flag) {
     pressure = modify->get_compute_by_id(id_press);
     if (!pressure)
@@ -884,8 +918,6 @@ void FixNHnew::setup(int /*vflag*/)
 
   t_current = temperature->compute_scalar();
   tdof = temperature->dof;
-  printf("tdof = %.16e\n", tdof);
-
   // t_target is needed by NVT and NPT in compute_scalar()
   // If no thermostat or using fix nphug,
   // t_target must be defined by other means.
@@ -952,11 +984,6 @@ void FixNHnew::setup(int /*vflag*/)
       for (int i = 3; i < 6; i++)
         if (p_flag[i]) omega_mass[i] = nkt * tau_baro * tau_baro * omega_mass_corr;
     }
-    printf("omega_mass= %.16e %.16e %.16e %.16e %.16e %.16e\n", omega_mass[0], omega_mass[1], omega_mass[2],
-         omega_mass[3], omega_mass[4], omega_mass[5]);
-    printf("nktv2p= %.16e\n", nktv2p);
-    printf("boltz= %.16e\n", boltz);
-
   // masses and initial forces on barostat thermostat variables
 
     if (mpchain) {
@@ -977,10 +1004,10 @@ void FixNHnew::setup(int /*vflag*/)
    1st half of Verlet update
 ------------------------------------------------------------------------- */
 
-void FixNHnew::initial_integrate(int /*vflag*/)
+void FixNHnew::initial_integrate(int vflag)
 {
   if (integrator == MIDDLE) {
-    initial_integrate_middle();
+    initial_integrate_middle(vflag);
     return;
   }
 
@@ -1042,6 +1069,31 @@ void FixNHnew::initial_integrate(int /*vflag*/)
     remap();
     if (kspace_flag) force->kspace->setup();
   }
+}
+
+/* ----------------------------------------------------------------------
+   Apply middle-integrator coordinate constraints immediately after the
+   coordinate propagation, before neighbor decisions, atom migration, and force
+   computation see the new positions.
+------------------------------------------------------------------------- */
+
+void FixNHnew::post_integrate()
+{
+  if (integrator == MIDDLE) {
+    constrain_positions(0);
+
+    if (domain->triclinic) domain->x2lamda(atom->nlocal);
+    domain->pbc();
+    if (domain->triclinic) domain->lamda2x(atom->nlocal);
+  }
+}
+
+/* ----------------------------------------------------------------------
+   Middle constraints are applied in post_integrate().
+------------------------------------------------------------------------- */
+
+void FixNHnew::pre_force(int /*vflag*/)
+{
 }
 
 /* ----------------------------------------------------------------------
@@ -1116,7 +1168,7 @@ void FixNHnew::final_integrate()
 /* ---------------------------------------------------------------------- */
 
 
-void FixNHnew::initial_integrate_middle()
+void FixNHnew::initial_integrate_middle(int vflag)
 {
   if (pstat_flag) {
     if (pstyle == ISO) {
@@ -1132,6 +1184,15 @@ void FixNHnew::initial_integrate_middle()
   if (pstat_flag) {
     compute_press_target();
     nh_omega_dot();
+  }
+
+  double **x = atom->x;
+  int nlocal = atom->nlocal;
+  if (atom->nmax > nmax) grow_arrays(atom->nmax);
+  for (int i = 0; i < nlocal; i++) {
+    x_reference[i][0] = x[i][0];
+    x_reference[i][1] = x[i][1];
+    x_reference[i][2] = x[i][2];
   }
 
   // A: half-step box remap
@@ -1150,11 +1211,7 @@ void FixNHnew::initial_integrate_middle()
   }
 
   double **v = atom->v;
-  int nlocal = atom->nlocal;
-  if (nlocal > nmax) {
-    nmax = nlocal;
-    memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-  }
+  if (atom->nmax > nmax) grow_arrays(atom->nmax);
   for (int i = 0; i < nlocal; i++) {
     v_backup[i][0] = v[i][0];
     v_backup[i][1] = v[i][1];
@@ -1182,7 +1239,6 @@ void FixNHnew::final_integrate_middle()
 {
 
   // measure fresh T and P from newly computed forces (Physics requires this!)
-
   t_current = temperature->compute_scalar();
   tdof = temperature->dof;
 
@@ -1209,6 +1265,26 @@ void FixNHnew::final_integrate_middle()
   // B: half-step velocity update
   nve_v();
   if (pstat_flag) nh_v_press();
+
+  // constrain_velocities();
+}
+
+/* ----------------------------------------------------------------------
+   Apply immediate coordinate constraints for the MIDDLE integrator.
+------------------------------------------------------------------------- */
+
+void FixNHnew::constrain_positions(int vflag)
+{
+  if (constrain_flag && constraint_fix) constraint_fix->correct_coordinates_middle(vflag, x_reference);
+}
+
+/* ----------------------------------------------------------------------
+   Apply immediate velocity constraints for the MIDDLE integrator.
+------------------------------------------------------------------------- */
+
+void FixNHnew::constrain_velocities()
+{
+  if (constrain_flag && constraint_fix) constraint_fix->correct_velocities();
 }
 
 // the end_of_step of this fix has to be the last end_of_step called in the timestep.
@@ -3532,5 +3608,67 @@ double FixNHnew::memory_usage()
 {
   double bytes = 0.0;
   if (irregular) bytes += irregular->memory_usage();
+  bytes += (double) nmax * 6 * sizeof(double);
   return bytes;
+}
+
+/* ----------------------------------------------------------------------
+   allocate atom-based arrays
+------------------------------------------------------------------------- */
+
+void FixNHnew::grow_arrays(int nmax_new)
+{
+  const int nold = nmax;
+  nmax = nmax_new;
+  memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+  memory->grow(x_reference, nmax, 3, "fix_npt:x_reference");
+
+  for (int i = nold; i < nmax; i++) {
+    v_backup[i][0] = v_backup[i][1] = v_backup[i][2] = 0.0;
+    x_reference[i][0] = x_reference[i][1] = x_reference[i][2] = 0.0;
+  }
+}
+
+/* ----------------------------------------------------------------------
+   copy atom-based arrays when atoms are sorted
+------------------------------------------------------------------------- */
+
+void FixNHnew::copy_arrays(int i, int j, int /*delflag*/)
+{
+  v_backup[j][0] = v_backup[i][0];
+  v_backup[j][1] = v_backup[i][1];
+  v_backup[j][2] = v_backup[i][2];
+  x_reference[j][0] = x_reference[i][0];
+  x_reference[j][1] = x_reference[i][1];
+  x_reference[j][2] = x_reference[i][2];
+}
+
+/* ----------------------------------------------------------------------
+   pack atom-based arrays for atom migration
+------------------------------------------------------------------------- */
+
+int FixNHnew::pack_exchange(int i, double *buf)
+{
+  buf[0] = v_backup[i][0];
+  buf[1] = v_backup[i][1];
+  buf[2] = v_backup[i][2];
+  buf[3] = x_reference[i][0];
+  buf[4] = x_reference[i][1];
+  buf[5] = x_reference[i][2];
+  return 6;
+}
+
+/* ----------------------------------------------------------------------
+   unpack atom-based arrays after atom migration
+------------------------------------------------------------------------- */
+
+int FixNHnew::unpack_exchange(int nlocal, double *buf)
+{
+  v_backup[nlocal][0] = buf[0];
+  v_backup[nlocal][1] = buf[1];
+  v_backup[nlocal][2] = buf[2];
+  x_reference[nlocal][0] = buf[3];
+  x_reference[nlocal][1] = buf[4];
+  x_reference[nlocal][2] = buf[5];
+  return 6;
 }

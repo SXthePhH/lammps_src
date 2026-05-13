@@ -46,7 +46,7 @@ static constexpr int RVOUS = 1;    // 0 for irregular, 1 for all2all
 static constexpr double BIG = 1.0e20;
 static constexpr double MASSDELTA = 0.1;
 
-enum{V,VP,XSHAKE};
+enum{XSHAKE,VTMP};
 
 /* ---------------------------------------------------------------------- */
 
@@ -54,8 +54,8 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), bond_flag(nullptr), angle_flag(nullptr), type_flag(nullptr),
     mass_list(nullptr), bond_distance(nullptr), angle_distance(nullptr), fstore(nullptr),
     loop_respa(nullptr), step_respa(nullptr), x(nullptr), v(nullptr), f(nullptr), ftmp(nullptr),
-    vtmp(nullptr), vp(nullptr), mass(nullptr), rmass(nullptr), type(nullptr), shake_flag(nullptr),
-    shake_atom(nullptr), shake_type(nullptr), xshake(nullptr), nshake(nullptr), list(nullptr),
+    vtmp(nullptr), mass(nullptr), rmass(nullptr), type(nullptr), shake_flag(nullptr),
+    shake_atom(nullptr), shake_type(nullptr), xshake(nullptr), xref(nullptr), nshake(nullptr), list(nullptr),
     closest_list(nullptr), b_count(nullptr), b_count_all(nullptr), b_ave(nullptr), b_max(nullptr),
     b_min(nullptr), b_ave_all(nullptr), b_max_all(nullptr), b_min_all(nullptr), a_count(nullptr),
     a_count_all(nullptr), a_ave(nullptr), a_max(nullptr), a_min(nullptr), a_ave_all(nullptr),
@@ -75,6 +75,8 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
   // to avoid uninitialized access
   vflag_post_force = 0;
   eflag_pre_reverse = 0;
+  external_constraints = 0;
+  internal_constraint_call = 0;
   ebond = 0.0;
   comm_mode = XSHAKE;
 
@@ -288,63 +290,6 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
   closest_list = nullptr;
 }
 
-/* ----------------------------------------------------------------------
-   Protected constructor for use by wrapper/derived classes (e.g. fix nh new + rattle).
-   Skips command-line arg parsing -- the derived class does its own.
-------------------------------------------------------------------------- */
-
-FixShake::FixShake(LAMMPS *lmp, int narg, char **arg, int) :
-    Fix(lmp, narg, arg), bond_flag(nullptr), angle_flag(nullptr), type_flag(nullptr),
-    mass_list(nullptr), bond_distance(nullptr), angle_distance(nullptr), fstore(nullptr),
-    loop_respa(nullptr), step_respa(nullptr), x(nullptr), v(nullptr), f(nullptr), ftmp(nullptr),
-    vtmp(nullptr), vp(nullptr), mass(nullptr), rmass(nullptr), type(nullptr), shake_flag(nullptr),
-    shake_atom(nullptr), shake_type(nullptr), xshake(nullptr), nshake(nullptr), list(nullptr),
-    closest_list(nullptr), b_count(nullptr), b_count_all(nullptr), b_ave(nullptr), b_max(nullptr),
-    b_min(nullptr), b_ave_all(nullptr), b_max_all(nullptr), b_min_all(nullptr), a_count(nullptr),
-    a_count_all(nullptr), a_ave(nullptr), a_max(nullptr), a_min(nullptr), a_ave_all(nullptr),
-    a_max_all(nullptr), a_min_all(nullptr), atommols(nullptr), onemols(nullptr)
-{
-  energy_global_flag = energy_peratom_flag = 1;
-  virial_global_flag = virial_peratom_flag = 1;
-  thermo_energy = thermo_virial = 1;
-  create_attribute = 1;
-  dof_flag = 1;
-  scalar_flag = 1;
-  extscalar = 1;
-  stores_ids = 1;
-  centroidstressflag = CENTROID_AVAIL;
-  next_output = -1;
-  vflag_post_force = 0;
-  eflag_pre_reverse = 0;
-  ebond = 0.0;
-
-  molecular = atom->molecular;
-  store_flag = peratom_flag = 0;
-  maxstore = -1;
-
-  FixShake::grow_arrays(atom->nmax);
-  atom->add_callback(Atom::GROW);
-  comm_forward = 3;
-
-  rattle = 0;
-  tolerance = 1.0e-4;
-  max_iter = 100;
-  output_every = 0;
-
-  // allocate empty constraint type arrays (will be filled by derived class)
-  bond_flag = new int[atom->nbondtypes + 1]();
-  angle_flag = new int[atom->nangletypes + 1]();
-  type_flag = new int[atom->ntypes + 1]();
-  mass_list = new double[atom->ntypes];
-  nmass = 0;
-
-  bond_distance = new double[atom->nbondtypes + 1]();
-  angle_distance = new double[atom->nangletypes + 1]();
-  onemols = nullptr;
-  kbond = 1.0e9 * force->boltz;
-  comm_mode = XSHAKE;
-}
-
 /* ---------------------------------------------------------------------- */
 
 FixShake::~FixShake()
@@ -385,9 +330,9 @@ FixShake::~FixShake()
   memory->destroy(shake_atom);
   memory->destroy(shake_type);
   memory->destroy(xshake);
+  memory->destroy(xref);
   memory->destroy(ftmp);
   memory->destroy(vtmp);
-  memory->destroy(vp);
 
   memory->destroy(fstore);
 
@@ -2951,188 +2896,116 @@ double FixShake::bond_force(int i1, int i2, double length)
   return r;
 }
 
+/* ---------------------------------------------------------------------- */
+
+void FixShake::set_external_constraints(int flag)
+{
+  external_constraints = flag;
+}
+
 /* ----------------------------------------------------------------------
-   RATTLE velocity constraint for 3-atom angle cluster
-   remove v components along the 3 constrained bonds
+   project velocities for size 2 cluster = single bond
 ------------------------------------------------------------------------- */
 
-void FixShake::vrattle3angle(int m)
+void FixShake::velocity_shake(int ilist)
 {
-  tagint i0,i1,i2;
-  double c[3], l[3], a[3][3], r01[3], imass[3],
-         r02[3], r12[3], vp01[3], vp02[3], vp12[3];
+  const int i0 = closest_list[ilist][0];
+  const int i1 = closest_list[ilist][1];
 
-  i0 = atom->map(shake_atom[m][0]);
-  i1 = atom->map(shake_atom[m][1]);
-  i2 = atom->map(shake_atom[m][2]);
-
-  MathExtra::sub3(x[i1],x[i0],r01);
-  MathExtra::sub3(x[i2],x[i0],r02);
-  MathExtra::sub3(x[i2],x[i1],r12);
-
+  double r01[3], v01[3], imass0, imass1;
+  sub3(x[i1], x[i0], r01);
   domain->minimum_image(FLERR, r01);
-  domain->minimum_image(FLERR, r02);
-  domain->minimum_image(FLERR, r12);
-
-  MathExtra::sub3(vp[i1],vp[i0],vp01);
-  MathExtra::sub3(vp[i2],vp[i0],vp02);
-  MathExtra::sub3(vp[i2],vp[i1],vp12);
+  sub3(vtmp[i1], vtmp[i0], v01);
 
   if (rmass) {
-    imass[0] = 1.0 / rmass[i0];
-    imass[1] = 1.0 / rmass[i1];
-    imass[2] = 1.0 / rmass[i2];
+    imass0 = 1.0 / rmass[i0];
+    imass1 = 1.0 / rmass[i1];
   } else {
-    imass[0] = 1.0 / mass[type[i0]];
-    imass[1] = 1.0 / mass[type[i1]];
-    imass[2] = 1.0 / mass[type[i2]];
+    imass0 = 1.0 / mass[type[i0]];
+    imass1 = 1.0 / mass[type[i1]];
   }
 
-  a[0][0]   =   (imass[1] + imass[0])   * MathExtra::dot3(r01,r01);
-  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
-  a[0][2]   =   (-imass[1]          )   * MathExtra::dot3(r01,r12);
-  a[1][0]   =   a[0][1];
-  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
-  a[1][2]   =   (imass[2]           )   * MathExtra::dot3(r02,r12);
-  a[2][0]   =   a[0][2];
-  a[2][1]   =   a[1][2];
-  a[2][2]   =   (imass[2] + imass[1])   * MathExtra::dot3(r12,r12);
+  const double r01sq = dot3(r01, r01);
+  if (r01sq == 0.0) error->one(FLERR, "Shake determinant = 0.0");
 
-  c[0]  = -MathExtra::dot3(vp01,r01);
-  c[1]  = -MathExtra::dot3(vp02,r02);
-  c[2]  = -MathExtra::dot3(vp12,r12);
+  const double lambda = -dot3(r01, v01) / (r01sq * (imass0 + imass1));
 
-  solve3x3exactly(a,c,l);
-
-  if (i0 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i0][k]  -=  imass[0]*  (  l[0] * r01[k] + l[1] * r02[k] );
-  }
-  if (i1 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i1][k]  -=  imass[1] * ( -l[0] * r01[k] + l[2] * r12[k] );
-  }
-  if (i2 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i2][k] -=   imass[2] * ( -l[1] * r02[k] - l[2] * r12[k] );
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
-void FixShake::vrattle2(int m)
-{
-  tagint    i0, i1;
-  double    imass[2], r01[3], vp01[3];
-
-  i0 = atom->map(shake_atom[m][0]);
-  i1 = atom->map(shake_atom[m][1]);
-
-  MathExtra::sub3(x[i1],x[i0],r01);
-  domain->minimum_image(FLERR, r01);
-
-  MathExtra::sub3(vp[i1],vp[i0],vp01);
-
-  if (rmass) {
-    imass[0] = 1.0 / rmass[i0];
-    imass[1] = 1.0 / rmass[i1];
-  } else {
-    imass[0] = 1.0 / mass[type[i0]];
-    imass[1] = 1.0 / mass[type[i1]];
-  }
-
-  double l01 = - MathExtra::dot3(r01,vp01) /
-    (MathExtra::dot3(r01,r01) * (imass[0] + imass[1]));
-
-  if (i0 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i0][k] -= imass[0] * l01 * r01[k];
-  }
-  if (i1 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i1][k] -= imass[1] * (-l01) * r01[k];
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
-void FixShake::vrattle3(int m)
-{
-  tagint    i0,i1,i2;
-  double    imass[3], r01[3], r02[3], vp01[3], vp02[3],
-            a[2][2],c[2],l[2];
-
-  i0 = atom->map(shake_atom[m][0]);
-  i1 = atom->map(shake_atom[m][1]);
-  i2 = atom->map(shake_atom[m][2]);
-
-  MathExtra::sub3(x[i1],x[i0],r01);
-  MathExtra::sub3(x[i2],x[i0],r02);
-
-  domain->minimum_image(FLERR, r01);
-  domain->minimum_image(FLERR, r02);
-
-  MathExtra::sub3(vp[i1],vp[i0],vp01);
-  MathExtra::sub3(vp[i2],vp[i0],vp02);
-
-  if (rmass) {
-    imass[0] = 1.0 / rmass[i0];
-    imass[1] = 1.0 / rmass[i1];
-    imass[2] = 1.0 / rmass[i2];
-  } else {
-    imass[0] = 1.0 / mass[type[i0]];
-    imass[1] = 1.0 / mass[type[i1]];
-    imass[2] = 1.0 / mass[type[i2]];
-  }
-
-  a[0][0]   =   (imass[1] + imass[0])   * MathExtra::dot3(r01,r01);
-  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
-  a[1][0]   =   a[0][1];
-  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
-
-  c[0]  = - MathExtra::dot3(vp01,r01);
-  c[1]  = - MathExtra::dot3(vp02,r02);
-
-  solve2x2exactly(a,c,l);
-
-  if (i0 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i0][k] -= imass[0] * (  l[0] * r01[k] + l[1] * r02[k] );
-  }
+  if (i0 < nlocal)
+    for (int k = 0; k < 3; k++) v[i0][k] -= imass0 * lambda * r01[k];
   if (i1 < nlocal)
-    for (int k=0; k<3; k++) {
-      v[i1][k] -= imass[1] * ( -l[0] * r01[k] );
-  }
-  if (i2 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i2][k] -= imass[2] * ( -l[1] * r02[k] );
-  }
+    for (int k = 0; k < 3; k++) v[i1][k] += imass1 * lambda * r01[k];
 }
 
-/* ---------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   project velocities for size 3 cluster = two bonds
+------------------------------------------------------------------------- */
 
-void FixShake::vrattle4(int m)
+void FixShake::velocity_shake3(int ilist)
 {
-  tagint    i0,i1,i2,i3;
-  double    imass[4], c[3], l[3], a[3][3],
-            r01[3], r02[3], r03[3], vp01[3], vp02[3], vp03[3];
+  const int i0 = closest_list[ilist][0];
+  const int i1 = closest_list[ilist][1];
+  const int i2 = closest_list[ilist][2];
 
-  i0 = atom->map(shake_atom[m][0]);
-  i1 = atom->map(shake_atom[m][1]);
-  i2 = atom->map(shake_atom[m][2]);
-  i3 = atom->map(shake_atom[m][3]);
+  double imass[3], r01[3], r02[3], v01[3], v02[3], a[2][2], c[2], l[2];
 
-  MathExtra::sub3(x[i1],x[i0],r01);
-  MathExtra::sub3(x[i2],x[i0],r02);
-  MathExtra::sub3(x[i3],x[i0],r03);
+  sub3(x[i1], x[i0], r01);
+  sub3(x[i2], x[i0], r02);
+  domain->minimum_image(FLERR, r01);
+  domain->minimum_image(FLERR, r02);
+  sub3(vtmp[i1], vtmp[i0], v01);
+  sub3(vtmp[i2], vtmp[i0], v02);
 
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+    imass[2] = 1.0 / rmass[i2];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+    imass[2] = 1.0 / mass[type[i2]];
+  }
+
+  a[0][0] = (imass[1] + imass[0]) * dot3(r01, r01);
+  a[0][1] = imass[0] * dot3(r01, r02);
+  a[1][0] = a[0][1];
+  a[1][1] = (imass[0] + imass[2]) * dot3(r02, r02);
+
+  c[0] = -dot3(v01, r01);
+  c[1] = -dot3(v02, r02);
+
+  solve2x2exactly(a, c, l);
+
+  if (i0 < nlocal)
+    for (int k = 0; k < 3; k++) v[i0][k] -= imass[0] * (l[0] * r01[k] + l[1] * r02[k]);
+  if (i1 < nlocal)
+    for (int k = 0; k < 3; k++) v[i1][k] += imass[1] * l[0] * r01[k];
+  if (i2 < nlocal)
+    for (int k = 0; k < 3; k++) v[i2][k] += imass[2] * l[1] * r02[k];
+}
+
+/* ----------------------------------------------------------------------
+   project velocities for size 4 cluster = three bonds
+------------------------------------------------------------------------- */
+
+void FixShake::velocity_shake4(int ilist)
+{
+  const int i0 = closest_list[ilist][0];
+  const int i1 = closest_list[ilist][1];
+  const int i2 = closest_list[ilist][2];
+  const int i3 = closest_list[ilist][3];
+
+  double imass[4], r01[3], r02[3], r03[3], v01[3], v02[3], v03[3],
+      a[3][3], c[3], l[3];
+
+  sub3(x[i1], x[i0], r01);
+  sub3(x[i2], x[i0], r02);
+  sub3(x[i3], x[i0], r03);
   domain->minimum_image(FLERR, r01);
   domain->minimum_image(FLERR, r02);
   domain->minimum_image(FLERR, r03);
-
-  MathExtra::sub3(vp[i1],vp[i0],vp01);
-  MathExtra::sub3(vp[i2],vp[i0],vp02);
-  MathExtra::sub3(vp[i3],vp[i0],vp03);
+  sub3(vtmp[i1], vtmp[i0], v01);
+  sub3(vtmp[i2], vtmp[i0], v02);
+  sub3(vtmp[i3], vtmp[i0], v03);
 
   if (rmass) {
     imass[0] = 1.0 / rmass[i0];
@@ -3146,85 +3019,120 @@ void FixShake::vrattle4(int m)
     imass[3] = 1.0 / mass[type[i3]];
   }
 
-  a[0][0]   =   (imass[0] + imass[1])   * MathExtra::dot3(r01,r01);
-  a[0][1]   =   (imass[0]           )   * MathExtra::dot3(r01,r02);
-  a[0][2]   =   (imass[0]           )   * MathExtra::dot3(r01,r03);
-  a[1][0]   =   a[0][1];
-  a[1][1]   =   (imass[0] + imass[2])   * MathExtra::dot3(r02,r02);
-  a[1][2]   =   (imass[0]           )   * MathExtra::dot3(r02,r03);
-  a[2][0]   =   a[0][2];
-  a[2][1]   =   a[1][2];
-  a[2][2]   =   (imass[0] + imass[3])   * MathExtra::dot3(r03,r03);
+  a[0][0] = (imass[0] + imass[1]) * dot3(r01, r01);
+  a[0][1] = imass[0] * dot3(r01, r02);
+  a[0][2] = imass[0] * dot3(r01, r03);
+  a[1][0] = a[0][1];
+  a[1][1] = (imass[0] + imass[2]) * dot3(r02, r02);
+  a[1][2] = imass[0] * dot3(r02, r03);
+  a[2][0] = a[0][2];
+  a[2][1] = a[1][2];
+  a[2][2] = (imass[0] + imass[3]) * dot3(r03, r03);
 
-  c[0]  = - MathExtra::dot3(vp01,r01);
-  c[1]  = - MathExtra::dot3(vp02,r02);
-  c[2]  = - MathExtra::dot3(vp03,r03);
+  c[0] = -dot3(v01, r01);
+  c[1] = -dot3(v02, r02);
+  c[2] = -dot3(v03, r03);
 
-  solve3x3exactly(a,c,l);
+  solve3x3exactly(a, c, l);
 
-  if (i0 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i0][k] -= imass[0] * (  l[0] * r01[k] + l[1] * r02[k] + l[2] * r03[k]);
+  if (i0 < nlocal)
+    for (int k = 0; k < 3; k++)
+      v[i0][k] -= imass[0] * (l[0] * r01[k] + l[1] * r02[k] + l[2] * r03[k]);
+  if (i1 < nlocal)
+    for (int k = 0; k < 3; k++) v[i1][k] += imass[1] * l[0] * r01[k];
+  if (i2 < nlocal)
+    for (int k = 0; k < 3; k++) v[i2][k] += imass[2] * l[1] * r02[k];
+  if (i3 < nlocal)
+    for (int k = 0; k < 3; k++) v[i3][k] += imass[3] * l[2] * r03[k];
+}
+
+/* ----------------------------------------------------------------------
+   project velocities for size 3 cluster = two bonds + angle
+------------------------------------------------------------------------- */
+
+void FixShake::velocity_shake3angle(int ilist)
+{
+  const int i0 = closest_list[ilist][0];
+  const int i1 = closest_list[ilist][1];
+  const int i2 = closest_list[ilist][2];
+
+  double c[3], l[3], a[3][3], r01[3], r02[3], r12[3],
+      v01[3], v02[3], v12[3], imass[3];
+
+  sub3(x[i1], x[i0], r01);
+  sub3(x[i2], x[i0], r02);
+  sub3(x[i2], x[i1], r12);
+  domain->minimum_image(FLERR, r01);
+  domain->minimum_image(FLERR, r02);
+  domain->minimum_image(FLERR, r12);
+  sub3(vtmp[i1], vtmp[i0], v01);
+  sub3(vtmp[i2], vtmp[i0], v02);
+  sub3(vtmp[i2], vtmp[i1], v12);
+
+  if (rmass) {
+    imass[0] = 1.0 / rmass[i0];
+    imass[1] = 1.0 / rmass[i1];
+    imass[2] = 1.0 / rmass[i2];
+  } else {
+    imass[0] = 1.0 / mass[type[i0]];
+    imass[1] = 1.0 / mass[type[i1]];
+    imass[2] = 1.0 / mass[type[i2]];
   }
-  if (i1 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i1][k] -= imass[1] * (-l[0] * r01[k]);
-  }
-  if (i2 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i2][k] -= imass[2] * ( -l[1] * r02[k]);
-  }
-  if (i3 < nlocal) {
-    for (int k=0; k<3; k++)
-      v[i3][k] -= imass[3] * ( -l[2] * r03[k]);
-  }
+
+  a[0][0] = (imass[1] + imass[0]) * dot3(r01, r01);
+  a[0][1] = imass[0] * dot3(r01, r02);
+  a[0][2] = -imass[1] * dot3(r01, r12);
+  a[1][0] = a[0][1];
+  a[1][1] = (imass[0] + imass[2]) * dot3(r02, r02);
+  a[1][2] = imass[2] * dot3(r02, r12);
+  a[2][0] = a[0][2];
+  a[2][1] = a[1][2];
+  a[2][2] = (imass[2] + imass[1]) * dot3(r12, r12);
+
+  c[0] = -dot3(v01, r01);
+  c[1] = -dot3(v02, r02);
+  c[2] = -dot3(v12, r12);
+
+  solve3x3exactly(a, c, l);
+
+  if (i0 < nlocal)
+    for (int k = 0; k < 3; k++) v[i0][k] -= imass[0] * (l[0] * r01[k] + l[1] * r02[k]);
+  if (i1 < nlocal)
+    for (int k = 0; k < 3; k++) v[i1][k] -= imass[1] * (-l[0] * r01[k] + l[2] * r12[k]);
+  if (i2 < nlocal)
+    for (int k = 0; k < 3; k++) v[i2][k] -= imass[2] * (-l[1] * r02[k] - l[2] * r12[k]);
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixShake::solve2x2exactly(const double a[][2],
-                                const double c[], double l[])
+void FixShake::solve2x2exactly(const double a[][2], const double c[], double l[])
 {
-  double determ, determinv;
+  const double determ = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+  if (determ == 0.0) error->one(FLERR, "Shake determinant = 0.0");
 
-  determ = a[0][0] * a[1][1] - a[0][1] * a[1][0];
-
-  if (determ == 0.0) error->one(FLERR,"Shake determinant = 0.0");
-  determinv = 1.0/determ;
-
-  l[0] = determinv * ( a[1][1] * c[0]  - a[0][1] * c[1]);
-  l[1] = determinv * (-a[1][0] * c[0]  + a[0][0] * c[1]);
+  const double determinv = 1.0 / determ;
+  l[0] = determinv * ( a[1][1] * c[0] - a[0][1] * c[1]);
+  l[1] = determinv * (-a[1][0] * c[0] + a[0][0] * c[1]);
 }
 
 /* ---------------------------------------------------------------------- */
 
-void FixShake::solve3x3exactly(const double a[][3],
-                                const double c[], double l[])
+void FixShake::solve3x3exactly(const double a[][3], const double c[], double l[])
 {
-  double A[3][3];
-  double detA,det1,det2,det3;
+  const double detA = a[0][0] * (a[1][1]*a[2][2] - a[1][2]*a[2][1])
+                    - a[0][1] * (a[1][0]*a[2][2] - a[1][2]*a[2][0])
+                    + a[0][2] * (a[1][0]*a[2][1] - a[1][1]*a[2][0]);
+  if (detA == 0.0) error->one(FLERR, "Shake determinant = 0.0");
 
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 3; j++)
-      A[i][j] = a[i][j];
-
-  detA = A[0][0] * (A[1][1]*A[2][2] - A[1][2]*A[2][1])
-       - A[0][1] * (A[1][0]*A[2][2] - A[1][2]*A[2][0])
-       + A[0][2] * (A[1][0]*A[2][1] - A[1][1]*A[2][0]);
-
-  if (detA == 0.0) error->one(FLERR,"Shake determinant = 0.0");
-
-  det1 = c[0] * (A[1][1]*A[2][2] - A[1][2]*A[2][1])
-       - A[0][1] * (c[1]*A[2][2]    - A[1][2]*c[2])
-       + A[0][2] * (c[1]*A[2][1]    - A[1][1]*c[2]);
-
-  det2 = A[0][0] * (c[1]*A[2][2]    - A[1][2]*c[2])
-       - c[0] * (A[1][0]*A[2][2] - A[1][2]*A[2][0])
-       + A[0][2] * (A[1][0]*c[2]    - c[1]*A[2][0]);
-
-  det3 = A[0][0] * (A[1][1]*c[2]    - c[1]*A[2][1])
-       - A[0][1] * (A[1][0]*c[2]    - c[1]*A[2][0])
-       + c[0] * (A[1][0]*A[2][1] - A[1][1]*A[2][0]);
+  const double det1 = c[0] * (a[1][1]*a[2][2] - a[1][2]*a[2][1])
+                    - a[0][1] * (c[1]*a[2][2] - a[1][2]*c[2])
+                    + a[0][2] * (c[1]*a[2][1] - a[1][1]*c[2]);
+  const double det2 = a[0][0] * (c[1]*a[2][2] - a[1][2]*c[2])
+                    - c[0] * (a[1][0]*a[2][2] - a[1][2]*a[2][0])
+                    + a[0][2] * (a[1][0]*c[2] - c[1]*a[2][0]);
+  const double det3 = a[0][0] * (a[1][1]*c[2] - c[1]*a[2][1])
+                    - a[0][1] * (a[1][0]*c[2] - c[1]*a[2][0])
+                    + c[0] * (a[1][0]*a[2][1] - a[1][1]*a[2][0]);
 
   l[0] = det1 / detA;
   l[1] = det2 / detA;
@@ -3485,7 +3393,6 @@ double FixShake::memory_usage()
   bytes += (double)nmax*3 * sizeof(int);
   bytes += (double)nmax*3 * sizeof(double);
   bytes += (double)maxvatom*6 * sizeof(double);
-  if (vp) bytes += (double)nmax*3 * sizeof(double);
   return bytes;
 }
 
@@ -3500,14 +3407,12 @@ void FixShake::grow_arrays(int nmax)
   memory->grow(shake_type,nmax,3,"shake:shake_type");
   memory->destroy(xshake);
   memory->create(xshake,nmax,3,"shake:xshake");
+  memory->destroy(xref);
+  memory->create(xref,nmax,3,"shake:xref");
   memory->destroy(ftmp);
   memory->create(ftmp,nmax,3,"shake:ftmp");
   memory->destroy(vtmp);
   memory->create(vtmp,nmax,3,"shake:vtmp");
-  if (rattle) {
-    memory->destroy(vp);
-    memory->create(vp,nmax,3,"shake:vp");
-  }
 }
 
 /* ----------------------------------------------------------------------
@@ -3720,28 +3625,15 @@ int FixShake::pack_forward_comm(int n, int *list, double *buf,
   double dx,dy,dz;
 
   m = 0;
-
-  if (comm_mode == VP) {
+  if (comm_mode == VTMP) {
     for (i = 0; i < n; i++) {
       j = list[i];
-      buf[m++] = vp[j][0];
-      buf[m++] = vp[j][1];
-      buf[m++] = vp[j][2];
+      buf[m++] = vtmp[j][0];
+      buf[m++] = vtmp[j][1];
+      buf[m++] = vtmp[j][2];
     }
     return m;
   }
-
-  if (comm_mode == V) {
-    for (i = 0; i < n; i++) {
-      j = list[i];
-      buf[m++] = v[j][0];
-      buf[m++] = v[j][1];
-      buf[m++] = v[j][2];
-    }
-    return m;
-  }
-
-  // default: XSHAKE - pack unconstrained coordinates
 
   if (pbc_flag == 0) {
     for (i = 0; i < n; i++) {
@@ -3779,25 +3671,14 @@ void FixShake::unpack_forward_comm(int n, int first, double *buf)
   m = 0;
   last = first + n;
 
-  if (comm_mode == VP) {
+  if (comm_mode == VTMP) {
     for (i = first; i < last; i++) {
-      vp[i][0] = buf[m++];
-      vp[i][1] = buf[m++];
-      vp[i][2] = buf[m++];
+      vtmp[i][0] = buf[m++];
+      vtmp[i][1] = buf[m++];
+      vtmp[i][2] = buf[m++];
     }
     return;
   }
-
-  if (comm_mode == V) {
-    for (i = first; i < last; i++) {
-      v[i][0] = buf[m++];
-      v[i][1] = buf[m++];
-      v[i][2] = buf[m++];
-    }
-    return;
-  }
-
-  // default: XSHAKE - unpack unconstrained coordinates
 
   for (i = first; i < last; i++) {
     xshake[i][0] = buf[m++];
@@ -3884,30 +3765,30 @@ void FixShake::shake_end_of_step(int vflag) {
    wrapper method for end_of_step fixes which modify velocities
 ------------------------------------------------------------------------- */
 
-void FixShake::correct_velocities() {
-
-  if (!rattle || !vp) return;
-
+void FixShake::correct_velocities()
+{
   for (int i = 0; i < atom->nlocal; i++) {
     if (shake_flag[i]) {
-      for (int k=0; k<3; k++)
-        vp[i][k] = v[i][k];
-    }
-    else
-      vp[i][0] = vp[i][1] = vp[i][2] = 0;
+      vtmp[i][0] = v[i][0];
+      vtmp[i][1] = v[i][1];
+      vtmp[i][2] = v[i][2];
+    } else vtmp[i][2] = vtmp[i][1] = vtmp[i][0] = 0.0;
   }
 
-  if (comm->nprocs > 1) {
-    comm_mode = VP;
-    comm->forward_comm(this);
-  }
+  double **xtmp = xshake;
+  comm_mode = VTMP;
+  xshake = vtmp;
+  comm->forward_comm(this);
+  xshake = xtmp;
+  comm_mode = XSHAKE;
 
+  int m;
   for (int i = 0; i < nlist; i++) {
-    int m = list[i];
-    if      (shake_flag[m] == 2)  vrattle2(m);
-    else if (shake_flag[m] == 3)  vrattle3(m);
-    else if (shake_flag[m] == 4)  vrattle4(m);
-    else                          vrattle3angle(m);
+    m = list[i];
+    if (shake_flag[m] == 2) velocity_shake(i);
+    else if (shake_flag[m] == 3) velocity_shake3(i);
+    else if (shake_flag[m] == 4) velocity_shake4(i);
+    else velocity_shake3angle(i);
   }
 }
 
@@ -3952,7 +3833,9 @@ void FixShake::correct_coordinates(int vflag) {
   // IMPORTANT: use 1 as argument and thereby enforce velocity Verlet
 
   dtfsq   = 0.5 * update->dt * update->dt * force->ftm2v;
+  internal_constraint_call = 1;
   FixShake::post_force(vflag);
+  internal_constraint_call = 0;
 
   // integrate coordinates: x' = xnp1 + dt^2/2m_i * f, where f is the constraining force
   // NOTE: After this command, the coordinates geometry of the molecules will be correct!
@@ -4003,4 +3886,115 @@ void FixShake::correct_coordinates(int vflag) {
   xshake = x;
   comm->forward_comm(this);
   xshake = xtmp;
+}
+
+/* ----------------------------------------------------------------------
+   calculate constraining forces from reference and propagated coordinates
+   for middle-scheme integrators
+------------------------------------------------------------------------- */
+
+void FixShake::correct_coordinates_middle(int vflag, double **x_reference)
+{
+  if (x_reference == nullptr)
+    error->all(FLERR, "Middle SHAKE coordinate constraints require reference coordinates");
+
+  x = atom->x;
+  v = atom->v;
+  f = atom->f;
+  mass = atom->mass;
+  rmass = atom->rmass;
+  type = atom->type;
+  nlocal = atom->nlocal;
+
+  if (store_flag) {
+    if (maxstore < atom->nmax) {
+      maxstore = MAX(atom->nmax,1);
+      memory->destroy(fstore);
+      memory->create(fstore, maxstore, 3, "shake/fstore");
+      for (int i = 0; i < maxstore; ++i) fstore[i][0] = fstore[i][1] = fstore[i][2] = 0.0;
+    }
+    array_atom = fstore;
+  }
+
+  for (int i = 0; i < nlocal; i++) {
+    for (int k = 0; k < 3; k++) {
+      ftmp[i][k] = f[i][k];
+      f[i][k] = 0.0;
+    }
+    if (shake_flag[i]) {
+      xref[i][0] = x_reference[i][0];
+      xref[i][1] = x_reference[i][1];
+      xref[i][2] = x_reference[i][2];
+      xshake[i][0] = x[i][0];
+      xshake[i][1] = x[i][1];
+      xshake[i][2] = x[i][2];
+    } else {
+      xref[i][0] = xref[i][1] = xref[i][2] = 0.0;
+      xshake[i][0] = xshake[i][1] = xshake[i][2] = 0.0;
+    }
+  }
+
+  comm->forward_comm(this);
+
+  double **xshake_saved = xshake;
+  xshake = xref;
+  comm->forward_comm(this);
+  xshake = xshake_saved;
+
+  double **x_current = x;
+  x = xref;
+
+  if (update->ntimestep == next_output) stats();
+
+  if (rattle) dtfsq = 0.5 * update->dt * update->dt * force->ftm2v;
+  else dtfsq = update->dt * update->dt * force->ftm2v;
+  int eflag = eflag_pre_reverse;
+  ev_init(eflag, vflag);
+  ebond = 0.0;
+
+  int m;
+  for (int i = 0; i < nlist; i++) {
+    m = list[i];
+    if (shake_flag[m] == 2) shake(i);
+    else if (shake_flag[m] == 3) shake3(i);
+    else if (shake_flag[m] == 4) shake4(i);
+    else shake3angle(i);
+  }
+
+  double dtfmsq;
+  if (rmass) {
+    for (int i = 0; i < nlocal; i++) {
+      dtfmsq = dtfsq / rmass[i];
+      x_current[i][0] += dtfmsq*f[i][0];
+      x_current[i][1] += dtfmsq*f[i][1];
+      x_current[i][2] += dtfmsq*f[i][2];
+    }
+  } else {
+    for (int i = 0; i < nlocal; i++) {
+      dtfmsq = dtfsq / mass[type[i]];
+      x_current[i][0] += dtfmsq*f[i][0];
+      x_current[i][1] += dtfmsq*f[i][1];
+      x_current[i][2] += dtfmsq*f[i][2];
+    }
+  }
+
+  if (store_flag) {
+    for (int j = 0; j < nlocal; ++j) {
+      for (int k = 0; k < 3; ++k) fstore[j][k] = f[j][k];
+    }
+  }
+
+  for (int j = 0; j < nlocal; ++j) {
+    for (int k = 0; k < 3; ++k) f[j][k] = ftmp[j][k];
+  }
+
+  if (!rattle) dtfsq = update->dt * update->dt * force->ftm2v;
+
+  x = x_current;
+  xshake_saved = xshake;
+  xshake = x_current;
+  comm->forward_comm(this);
+  xshake = xshake_saved;
+
+  vflag_post_force = vflag;
 }
