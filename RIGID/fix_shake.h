@@ -35,6 +35,9 @@ class FixShake : public Fix {
   void init() override;
   void setup(int) override;
   void setup_pre_reverse(int, int) override;
+  void initial_integrate(int) override;
+  void post_integrate() override;
+  void end_of_step() override;
   void min_setup(int) override;
   void pre_neighbor() override;
   void post_force(int) override;
@@ -54,10 +57,9 @@ class FixShake : public Fix {
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
 
-  void set_external_constraints(int);
   virtual void shake_end_of_step(int vflag);
   virtual void correct_coordinates(int vflag);
-  virtual void correct_coordinates_middle(int vflag, double **x_reference);
+  virtual void correct_coordinates_middle(int vflag);
   virtual void correct_velocities();
 
   bigint dof(int) override;
@@ -68,8 +70,8 @@ class FixShake : public Fix {
  protected:
   int vflag_post_force;     // store the vflag of last post_force call
   int eflag_pre_reverse;    // store the eflag of last pre_reverse call
-  int external_constraints;  // 1 if another integrator drives projection constraints
   int internal_constraint_call;
+  int middle_constraints;    // 1 if position projection happens after initial integrate
   int respa;                // 0 = vel. Verlet, 1 = respa
   int rattle;               // 0 = SHAKE, 1 = RATTLE
   double tolerance;         // SHAKE tolerance

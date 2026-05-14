@@ -75,8 +75,8 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
   // to avoid uninitialized access
   vflag_post_force = 0;
   eflag_pre_reverse = 0;
-  external_constraints = 0;
   internal_constraint_call = 0;
+  middle_constraints = 0;
   ebond = 0.0;
   comm_mode = XSHAKE;
 
@@ -155,7 +155,7 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
     // break if known optional keyword
 
     } else if ((strcmp(arg[next], "mol") == 0) || (strcmp(arg[next], "kbond") == 0) ||
-               (strcmp(arg[next], "store") == 0)) {
+               (strcmp(arg[next], "store") == 0) || (strcmp(arg[next], "middle") == 0)) {
       break;
 
     // get numeric types for b, a, t, or m keywords.
@@ -229,6 +229,10 @@ FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
         size_peratom_cols = 0;
         peratom_freq = 0;
       }
+      iarg += 2;
+    } else if (strcmp(arg[iarg],"middle") == 0) {
+      if (iarg+2 > narg) utils::missing_cmd_args(FLERR,mystyle+" middle",error);
+      middle_constraints = utils::logical(FLERR, arg[iarg+1], false, lmp);
       iarg += 2;
     } else error->all(FLERR,"Unknown {} command option: {}", mystyle, arg[iarg]);
   }
@@ -374,11 +378,19 @@ int FixShake::setmask()
 {
   int mask = 0;
   mask |= PRE_NEIGHBOR;
-  mask |= POST_FORCE;
-  mask |= POST_FORCE_RESPA;
-  mask |= MIN_PRE_REVERSE;
-  mask |= MIN_POST_FORCE;
   mask |= POST_RUN;
+  if (middle_constraints) {
+    mask |= INITIAL_INTEGRATE;
+    mask |= POST_INTEGRATE;
+    mask |= POST_FORCE;
+    mask |= POST_FORCE_RESPA;
+    mask |= END_OF_STEP;
+  } else {
+    mask |= POST_FORCE;
+    mask |= POST_FORCE_RESPA;
+    mask |= MIN_PRE_REVERSE;
+    mask |= MIN_POST_FORCE;
+  }
   return mask;
 }
 
@@ -543,17 +555,62 @@ void FixShake::setup(int vflag)
     dtf_inner = dtf_innerhalf;
   }
 
-  // correct geometry of cluster if necessary
+  if (middle_constraints) {
+    correct_coordinates(vflag);
+    correct_velocities();
+    shake_end_of_step(vflag);
+  } else {
+    // correct geometry of cluster if necessary
+    correct_coordinates(vflag);
 
-  correct_coordinates(vflag);
+    // remove velocities along any bonds
+    correct_velocities();
 
-  // remove velocities along any bonds
+    // precalculate constraining forces for first integration step
+    shake_end_of_step(vflag);
+  }
+}
 
-  correct_velocities();
+/* ----------------------------------------------------------------------
+   save reference coordinates before the integrator moves atoms
+------------------------------------------------------------------------- */
 
-  // precalculate constraining forces for first integration step
+void FixShake::initial_integrate(int /*vflag*/)
+{
+  if (!middle_constraints) return;
 
-  shake_end_of_step(vflag);
+  for (int i = 0; i < nlocal; i++) {
+    if (shake_flag[i]) {
+      xref[i][0] = x[i][0];
+      xref[i][1] = x[i][1];
+      xref[i][2] = x[i][2];
+    } else xref[i][0] = xref[i][1] = xref[i][2] = 0.0;
+  }
+
+}
+
+/* ----------------------------------------------------------------------
+   project coordinates after the integrator moves atoms and before forces
+------------------------------------------------------------------------- */
+
+void FixShake::post_integrate()
+{
+  if (!middle_constraints) return;
+  correct_coordinates_middle(0);
+
+  if (domain->triclinic) domain->x2lamda(atom->nlocal);
+  domain->pbc();
+  if (domain->triclinic) domain->lamda2x(atom->nlocal);
+}
+
+/* ----------------------------------------------------------------------
+   project velocities after final integration for middle constraints
+------------------------------------------------------------------------- */
+
+void FixShake::end_of_step()
+{
+  if (!middle_constraints) return;
+  // correct_velocities();  // now I do not want the velocity constraints to be applied at the end of the step, only the coordinate constraints
 }
 
 /* ----------------------------------------------------------------------
@@ -2898,11 +2955,6 @@ double FixShake::bond_force(int i1, int i2, double length)
 
 /* ---------------------------------------------------------------------- */
 
-void FixShake::set_external_constraints(int flag)
-{
-  external_constraints = flag;
-}
-
 /* ----------------------------------------------------------------------
    project velocities for size 2 cluster = single bond
 ------------------------------------------------------------------------- */
@@ -3893,10 +3945,9 @@ void FixShake::correct_coordinates(int vflag) {
    for middle-scheme integrators
 ------------------------------------------------------------------------- */
 
-void FixShake::correct_coordinates_middle(int vflag, double **x_reference)
+void FixShake::correct_coordinates_middle(int vflag)
 {
-  if (x_reference == nullptr)
-    error->all(FLERR, "Middle SHAKE coordinate constraints require reference coordinates");
+  if (!middle_constraints) return;
 
   x = atom->x;
   v = atom->v;
@@ -3922,14 +3973,10 @@ void FixShake::correct_coordinates_middle(int vflag, double **x_reference)
       f[i][k] = 0.0;
     }
     if (shake_flag[i]) {
-      xref[i][0] = x_reference[i][0];
-      xref[i][1] = x_reference[i][1];
-      xref[i][2] = x_reference[i][2];
       xshake[i][0] = x[i][0];
       xshake[i][1] = x[i][1];
       xshake[i][2] = x[i][2];
     } else {
-      xref[i][0] = xref[i][1] = xref[i][2] = 0.0;
       xshake[i][0] = xshake[i][1] = xshake[i][2] = 0.0;
     }
   }

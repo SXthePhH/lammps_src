@@ -104,13 +104,11 @@ FixRattle::~FixRattle()
 
 int FixRattle::setmask()
 {
-  int mask = 0;
-  mask |= PRE_NEIGHBOR;
-  mask |= POST_FORCE;
-  mask |= POST_FORCE_RESPA;
-  mask |= FINAL_INTEGRATE;
-  mask |= FINAL_INTEGRATE_RESPA;
-  mask |= MIN_POST_FORCE;
+  int mask = FixShake::setmask();
+  if (!middle_constraints) {
+    mask |= FINAL_INTEGRATE;
+    mask |= FINAL_INTEGRATE_RESPA;
+  }
 #if RATTLE_DEBUG
   mask |= END_OF_STEP;
 #endif
@@ -147,7 +145,11 @@ void FixRattle::init() {
 
 void FixRattle::post_force(int vflag)
 {
-  if (external_constraints) return;
+  if (middle_constraints) {
+    comm_mode = XSHAKE;
+    FixShake::post_force(vflag);
+    return;
+  }
 
   // remember vflag for the coordinate correction in this->final_integrate
 
@@ -181,7 +183,11 @@ void FixRattle::post_force(int vflag)
 
 void FixRattle::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 {
-  if (external_constraints) return;
+  if (middle_constraints) {
+    comm_mode = XSHAKE;
+    FixShake::post_force_respa(vflag, ilevel, loop_respa[ilevel]-1);
+    return;
+  }
 
   // remember vflag for the coordinate correction in this->final_integrate
 
@@ -217,8 +223,6 @@ void FixRattle::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 
 void FixRattle::final_integrate()
 {
-  if (external_constraints) return;
-
   comm_mode = XSHAKE;
   FixShake::post_force(vflag_post_force);
 }
@@ -227,8 +231,6 @@ void FixRattle::final_integrate()
 
 void FixRattle::final_integrate_respa(int ilevel, int iloop)
 {
-  if (external_constraints) return;
-
   comm_mode = XSHAKE;
   FixShake::post_force_respa(vflag_post_force, ilevel, iloop);
 }
@@ -748,9 +750,9 @@ void FixRattle::correct_coordinates(int vflag) {
   FixShake::correct_coordinates(vflag);
 }
 
-void FixRattle::correct_coordinates_middle(int vflag, double **x_reference) {
+void FixRattle::correct_coordinates_middle(int vflag) {
   comm_mode = XSHAKE;
-  FixShake::correct_coordinates_middle(vflag, x_reference);
+  FixShake::correct_coordinates_middle(vflag);
 }
 
 /* ----------------------------------------------------------------------
@@ -801,6 +803,11 @@ void FixRattle::correct_velocities() {
 
 void FixRattle::end_of_step()
 {
+  if (middle_constraints) {
+    FixShake::end_of_step();
+    return;
+  }
+
   if (comm->nprocs > 1) {
     comm_mode = V;
     comm->forward_comm(this);

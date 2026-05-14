@@ -41,7 +41,7 @@ class FixRattle : public FixShake {
   void final_integrate_respa(int, int) override;
 
   void correct_coordinates(int vflag) override;
-  void correct_coordinates_middle(int vflag, double **x_reference) override;
+  void correct_coordinates_middle(int vflag) override;
   void correct_velocities() override;
   void shake_end_of_step(int vflag) override;
 

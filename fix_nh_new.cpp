@@ -24,7 +24,6 @@
 #include "domain.h"
 #include "error.h"
 #include "fix_deform.h"
-#include "RIGID/fix_shake.h"
 #include "force.h"
 #include "group.h"
 #include "irregular.h"
@@ -60,10 +59,10 @@ enum{NOBIAS,BIAS};
 
 FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), id_dilate(nullptr), irregular(nullptr), step_respa(nullptr), id_temp(nullptr),
-    id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
+  id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
   etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr),
   id_temp_snapshot(nullptr), temperature_snapshot(nullptr), tsnapshotflag(0),
-  v_backup(nullptr), x_reference(nullptr), nmax(0)
+  v_backup(nullptr), nmax(0)
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
@@ -71,8 +70,6 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   nh_press_flag = 0; // defalut use langevin 
   big_mass_flag = 0;
   big_omega_update_flag = 0;
-  constrain_flag = 0;
-  constraint_fix = nullptr;
 
   restart_global = 1;
   dynamic_group_allow = 1;
@@ -454,10 +451,6 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
       zero_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
       iarg += 2;
 
-    } else if (strcmp(arg[iarg], "constrain") == 0) {
-      constrain_flag = 1;
-      iarg += 1;
-
     }else error->all(FLERR,"Unknown fix {} keyword: {}", style, arg[iarg]);
   }
 
@@ -693,7 +686,6 @@ FixNHnew::~FixNHnew()
   delete irregular;
   if (integrator == MIDDLE && modify->get_fix_by_id(id)) atom->delete_callback(id, Atom::GROW);
   memory->destroy(v_backup);
-  memory->destroy(x_reference);
 
   // delete temperature and pressure if fix created them
 
@@ -733,7 +725,6 @@ int FixNHnew::setmask()
   mask |= FINAL_INTEGRATE_RESPA;
   mask |= PRE_FORCE_RESPA;
   if (integrator == MIDDLE) mask |= END_OF_STEP;
-  if (integrator == MIDDLE && constrain_flag) mask |= POST_INTEGRATE;
   if (pre_exchange_flag) mask |= PRE_EXCHANGE;
   return mask;
 }
@@ -761,27 +752,6 @@ void FixNHnew::init()
                      "same component of stress tensor", style);
       }
     }
-
-  constraint_fix = nullptr;
-  if (constrain_flag) {
-    if (integrator != MIDDLE)
-      error->all(FLERR, "Fix {} constrain keyword requires integrator middle", style);
-
-    int nconstraint = 0;
-    for (int i = 0; i < modify->nfix; i++) {
-      if (strcmp(modify->fix[i]->style, "shake") == 0 ||
-          strcmp(modify->fix[i]->style, "rattle") == 0) {
-        constraint_fix = dynamic_cast<FixShake *>(modify->fix[i]);
-        nconstraint++;
-      }
-    }
-
-    if (nconstraint == 0)
-      error->all(FLERR, "Fix {} constrain keyword requires a fix shake or fix rattle", style);
-    if (nconstraint > 1)
-      error->all(FLERR, "Fix {} constrain keyword found multiple fix shake/rattle instances", style);
-    if (constraint_fix) constraint_fix->set_external_constraints(1);
-  }
 
   // set temperature and pressure ptrs
 
@@ -1072,31 +1042,6 @@ void FixNHnew::initial_integrate(int vflag)
 }
 
 /* ----------------------------------------------------------------------
-   Apply middle-integrator coordinate constraints immediately after the
-   coordinate propagation, before neighbor decisions, atom migration, and force
-   computation see the new positions.
-------------------------------------------------------------------------- */
-
-void FixNHnew::post_integrate()
-{
-  if (integrator == MIDDLE) {
-    constrain_positions(0);
-
-    if (domain->triclinic) domain->x2lamda(atom->nlocal);
-    domain->pbc();
-    if (domain->triclinic) domain->lamda2x(atom->nlocal);
-  }
-}
-
-/* ----------------------------------------------------------------------
-   Middle constraints are applied in post_integrate().
-------------------------------------------------------------------------- */
-
-void FixNHnew::pre_force(int /*vflag*/)
-{
-}
-
-/* ----------------------------------------------------------------------
    2nd half of Verlet update
 ------------------------------------------------------------------------- */
 
@@ -1186,14 +1131,8 @@ void FixNHnew::initial_integrate_middle(int vflag)
     nh_omega_dot();
   }
 
-  double **x = atom->x;
   int nlocal = atom->nlocal;
   if (atom->nmax > nmax) grow_arrays(atom->nmax);
-  for (int i = 0; i < nlocal; i++) {
-    x_reference[i][0] = x[i][0];
-    x_reference[i][1] = x[i][1];
-    x_reference[i][2] = x[i][2];
-  }
 
   // A: half-step box remap
   if (pstat_flag) remap();
@@ -1266,25 +1205,6 @@ void FixNHnew::final_integrate_middle()
   nve_v();
   if (pstat_flag) nh_v_press();
 
-  // constrain_velocities();
-}
-
-/* ----------------------------------------------------------------------
-   Apply immediate coordinate constraints for the MIDDLE integrator.
-------------------------------------------------------------------------- */
-
-void FixNHnew::constrain_positions(int vflag)
-{
-  if (constrain_flag && constraint_fix) constraint_fix->correct_coordinates_middle(vflag, x_reference);
-}
-
-/* ----------------------------------------------------------------------
-   Apply immediate velocity constraints for the MIDDLE integrator.
-------------------------------------------------------------------------- */
-
-void FixNHnew::constrain_velocities()
-{
-  if (constrain_flag && constraint_fix) constraint_fix->correct_velocities();
 }
 
 // the end_of_step of this fix has to be the last end_of_step called in the timestep.
@@ -3608,7 +3528,7 @@ double FixNHnew::memory_usage()
 {
   double bytes = 0.0;
   if (irregular) bytes += irregular->memory_usage();
-  bytes += (double) nmax * 6 * sizeof(double);
+  bytes += (double) nmax * 3 * sizeof(double);
   return bytes;
 }
 
@@ -3621,11 +3541,9 @@ void FixNHnew::grow_arrays(int nmax_new)
   const int nold = nmax;
   nmax = nmax_new;
   memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-  memory->grow(x_reference, nmax, 3, "fix_npt:x_reference");
 
   for (int i = nold; i < nmax; i++) {
     v_backup[i][0] = v_backup[i][1] = v_backup[i][2] = 0.0;
-    x_reference[i][0] = x_reference[i][1] = x_reference[i][2] = 0.0;
   }
 }
 
@@ -3638,9 +3556,6 @@ void FixNHnew::copy_arrays(int i, int j, int /*delflag*/)
   v_backup[j][0] = v_backup[i][0];
   v_backup[j][1] = v_backup[i][1];
   v_backup[j][2] = v_backup[i][2];
-  x_reference[j][0] = x_reference[i][0];
-  x_reference[j][1] = x_reference[i][1];
-  x_reference[j][2] = x_reference[i][2];
 }
 
 /* ----------------------------------------------------------------------
@@ -3652,10 +3567,7 @@ int FixNHnew::pack_exchange(int i, double *buf)
   buf[0] = v_backup[i][0];
   buf[1] = v_backup[i][1];
   buf[2] = v_backup[i][2];
-  buf[3] = x_reference[i][0];
-  buf[4] = x_reference[i][1];
-  buf[5] = x_reference[i][2];
-  return 6;
+  return 3;
 }
 
 /* ----------------------------------------------------------------------
@@ -3667,8 +3579,5 @@ int FixNHnew::unpack_exchange(int nlocal, double *buf)
   v_backup[nlocal][0] = buf[0];
   v_backup[nlocal][1] = buf[1];
   v_backup[nlocal][2] = buf[2];
-  x_reference[nlocal][0] = buf[3];
-  x_reference[nlocal][1] = buf[4];
-  x_reference[nlocal][2] = buf[5];
-  return 6;
+  return 3;
 }
