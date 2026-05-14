@@ -18,4 +18,10 @@ if you want to use the middle integrator with langevin thermo/barostat then the 
 
 fix 1 all npt/new iso (press args) temp (temp args) integrator middle barostat langevin thermostat langevin
 
-now the default is middle langevin 
+now the default is middle langevin, so you can actually skip writing "thermostat langevin" and "barosta langevin"
+
+New fix shake now has been added, if you want to run NPT wiith constrian, simply add a fix shake command BEFORE the fix npt/new
+and the fix shake command is different from the traditional ones, if you want to use shake compatible to middle integrator, you must add "middle yes" at the end of the fix command 
+
+example:
+fix SHAKE all shake 1e-4 100 0 b 1 a 1 middle yes
