@@ -869,12 +869,12 @@ void FixNHnew::init()
   // printf("mvv2e: %f\n", force->mvv2e);
 
   lan_c1_p = exp(-gamma_p * dt);
-  if (big_omega_update_flag == 1 && pstyle == ISO) lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target);
-  else lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target / pdim);
+  if (big_omega_update_flag == 0 && pstyle == ISO) lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target / pdim);
+  else lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target);
 
   lan_c1_p_2 = exp(-gamma_p * dt2);
-  if (big_omega_update_flag == 1 && pstyle == ISO) lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target);
-  else lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target / pdim);
+  if (big_omega_update_flag == 0 && pstyle == ISO) lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target / pdim);
+  else lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target);
 
 }
 
