@@ -48,8 +48,6 @@ static constexpr double MASSDELTA = 0.1;
 
 enum{XSHAKE,VTMP};
 
-/* ---------------------------------------------------------------------- */
-
 FixShake::FixShake(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), bond_flag(nullptr), angle_flag(nullptr), type_flag(nullptr),
     mass_list(nullptr), bond_distance(nullptr), angle_distance(nullptr), fstore(nullptr),
@@ -596,11 +594,14 @@ void FixShake::initial_integrate(int /*vflag*/)
 void FixShake::post_integrate()
 {
   if (!middle_constraints) return;
-  correct_coordinates_middle(0);
 
-  if (domain->triclinic) domain->x2lamda(atom->nlocal);
-  domain->pbc();
-  if (domain->triclinic) domain->lamda2x(atom->nlocal);
+  // Refresh closest-image bookkeeping for SHAKE clusters after the middle-step
+  // projection, but keep atom coordinates in their current continuous
+  // representation. This matches the normal Verlet path, where atoms are not
+  // rewrapped between integration and pair-force evaluation on non-reneighbor
+  // steps, and avoids forcing an expensive full neighbor rebuild every step.
+  pre_neighbor();
+  correct_coordinates_middle(0);
 }
 
 /* ----------------------------------------------------------------------
@@ -4036,6 +4037,7 @@ void FixShake::correct_coordinates_middle(int vflag)
   }
 
   if (!rattle) dtfsq = update->dt * update->dt * force->ftm2v;
+
 
   x = x_current;
   xshake_saved = xshake;
