@@ -219,6 +219,7 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
       p_stop[0] = p_stop[1] = p_stop[2] = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       p_period[0] = p_period[1] = p_period[2] =
         utils::numeric(FLERR,arg[iarg+3],false,lmp);
+      damp_p = p_period[0];
       p_flag[0] = p_flag[1] = p_flag[2] = 1;
       if (dimension == 2) {
         p_start[2] = p_stop[2] = p_period[2] = 0.0;
@@ -1115,6 +1116,10 @@ void FixNHnew::final_integrate()
 
 void FixNHnew::initial_integrate_middle(int vflag)
 {
+    // B: half-step velocity update
+  nve_v();
+  if (pstat_flag) nh_v_press();
+
   if (pstat_flag) {
     if (pstyle == ISO) {
       temperature->compute_scalar();
@@ -1201,9 +1206,7 @@ void FixNHnew::final_integrate_middle()
     nh_v_press();
   }
   nve_v();
-  // B: half-step velocity update
-  nve_v();
-  if (pstat_flag) nh_v_press();
+
 
 }
 
@@ -3382,11 +3385,14 @@ void FixNHnew::nh_omega_dot()
       // mtk_term1 /= pdim * atom->natoms;
       mtk_term1 /= tdof;  // experimental
     } else {
-      double *mvv_current = temperature->vector;
+      double *mvv_current = temperature->vector;   
       for (int i = 0; i < 3; i++)
-        if (p_flag[i])
+        if (p_flag[i]) // when ANISO, these are all 1
+        {
           mtk_term1 += mvv_current[i];
-      mtk_term1 /= pdim * atom->natoms;
+        }
+      // mtk_term1 /= pdim * atom->natoms;
+      mtk_term1 /= tdof;  // experimental
     }
   }
 
