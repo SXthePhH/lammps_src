@@ -1076,6 +1076,8 @@ void FixNHnew::final_integrate()
 void FixNHnew::initial_integrate_middle(int vflag)
 {
     // B: half-step velocity update
+  if (pstat_flag) nh_v_press();
+  nve_v();
   nve_v();
   if (pstat_flag) nh_v_press();
 
@@ -1150,9 +1152,9 @@ void FixNHnew::final_integrate_middle()
   // half-step barostat omega update using fresh P
   if (pstat_flag) {
     nh_omega_dot();
-    nh_v_press();
+    // nh_v_press();
   }
-  nve_v();
+  // nve_v();
 
 
 }
