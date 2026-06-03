@@ -31,11 +31,9 @@
 #include "memory.h"
 #include "modify.h"
 #include "neighbor.h"
-#include "thermo.h"
 #include "respa.h"
 #include "update.h"
 #include "random_mars.h"
-#include "output.h"
 
 #include <cmath>
 #include <cstring>
@@ -60,9 +58,7 @@ enum{NOBIAS,BIAS};
 FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), id_dilate(nullptr), irregular(nullptr), step_respa(nullptr), id_temp(nullptr),
   id_press(nullptr), eta(nullptr), eta_dot(nullptr), eta_dotdot(nullptr), eta_mass(nullptr),
-  etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr),
-  id_temp_snapshot(nullptr), temperature_snapshot(nullptr), tsnapshotflag(0),
-  v_backup(nullptr), nmax(0)
+  etap(nullptr), etap_dot(nullptr), etap_dotdot(nullptr), etap_mass(nullptr), random(nullptr)
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
@@ -103,7 +99,6 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
 
   tcomputeflag = 0;
   pcomputeflag = 0;
-  tsnapshotflag = 0;
 
   // turn on tilt factor scaling, whenever applicable
 
@@ -670,10 +665,6 @@ FixNHnew::FixNHnew(LAMMPS *lmp, int narg, char **arg) :
   gamma_p = 1.0 / damp_p;
   random = new RanMars(lmp,seed);
 
-  if (integrator == MIDDLE) {
-    grow_arrays(atom->nmax);
-    atom->add_callback(Atom::GROW);
-  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -685,16 +676,10 @@ FixNHnew::~FixNHnew()
 
   delete[] id_dilate;
   delete irregular;
-  if (integrator == MIDDLE && modify->get_fix_by_id(id)) atom->delete_callback(id, Atom::GROW);
-  memory->destroy(v_backup);
-
   // delete temperature and pressure if fix created them
 
   if (tcomputeflag) modify->delete_compute(id_temp);
   delete[] id_temp;
-
-  if (tsnapshotflag) modify->delete_compute(id_temp_snapshot);
-  delete[] id_temp_snapshot;
 
   if (tstat_flag) {
     delete[] eta;
@@ -725,7 +710,6 @@ int FixNHnew::setmask()
   mask |= INITIAL_INTEGRATE_RESPA;
   mask |= FINAL_INTEGRATE_RESPA;
   mask |= PRE_FORCE_RESPA;
-  if (integrator == MIDDLE) mask |= END_OF_STEP;
   if (pre_exchange_flag) mask |= PRE_EXCHANGE;
   return mask;
 }
@@ -771,31 +755,6 @@ void FixNHnew::init()
       error->all(FLERR,"Pressure compute ID {} for fix {} does not exist", id_press, style);
     if (pressure->pressflag == 0)
       error->all(FLERR,"Compute ID {} for fix {} does not compute pressure", id_press, style);
-  }
-
-  if (integrator == MIDDLE) {
-    if (!tsnapshotflag) {
-      id_temp_snapshot = utils::strdup(std::string(id) + std::string("_temp_snapshot"));
-      temperature_snapshot = modify->add_compute(
-          fmt::format("{} all temp/fixbackup {}", id_temp_snapshot, id));
-      tsnapshotflag = 1;
-    } else {
-      temperature_snapshot = modify->get_compute_by_id(id_temp_snapshot);
-    }
-
-    if (!temperature_snapshot)
-      error->all(FLERR, "Snapshot temperature compute ID {} for fix {} does not exist",
-                 id_temp_snapshot, style);
-    if (temperature_snapshot->tempflag == 0)
-      error->all(FLERR, "Compute ID {} for fix {} does not compute a temperature",
-                 id_temp_snapshot, style);
-
-    if (output && output->thermo && output->thermo->modified == 0) {
-      char *arg_temp[2];
-      arg_temp[0] = const_cast<char *>("temp");
-      arg_temp[1] = id_temp_snapshot;
-      output->thermo->modify_params(2, arg_temp);
-    }
   }
 
   // set timesteps and frequencies
@@ -1136,9 +1095,6 @@ void FixNHnew::initial_integrate_middle(int vflag)
     nh_omega_dot();
   }
 
-  int nlocal = atom->nlocal;
-  if (atom->nmax > nmax) grow_arrays(atom->nmax);
-
   // A: half-step box remap
   if (pstat_flag) remap();
   // A: full-step position update
@@ -1153,15 +1109,6 @@ void FixNHnew::initial_integrate_middle(int vflag)
     }
     else if (nh_press_flag == 0) langevin_press();
   }
-
-  double **v = atom->v;
-  if (atom->nmax > nmax) grow_arrays(atom->nmax);
-  for (int i = 0; i < nlocal; i++) {
-    v_backup[i][0] = v[i][0];
-    v_backup[i][1] = v[i][1];
-    v_backup[i][2] = v[i][2];
-  }
-
 
   if (tstat_flag) {
     compute_temp_target();
@@ -1210,11 +1157,6 @@ void FixNHnew::final_integrate_middle()
 
 }
 
-// the end_of_step of this fix has to be the last end_of_step called in the timestep.
-
-void FixNHnew::end_of_step()
-{
-}
 /* ----------------------------------------------------------------------
    Langevin thermostat O-step on particle velocities.
 ---------------------------------------------------------------------- */
@@ -2567,9 +2509,6 @@ void *FixNHnew::extract(const char *str, int &dim)
     return &mpchain;
   }
   dim=1;
-  if (strcmp(str,"v_backup") == 0) {
-    return &v_backup;
-  }
   if (tstat_flag && strcmp(str,"eta") == 0) {
     return &eta;
   } else if (pstat_flag && strcmp(str,"etap") == 0) {
@@ -3534,56 +3473,5 @@ double FixNHnew::memory_usage()
 {
   double bytes = 0.0;
   if (irregular) bytes += irregular->memory_usage();
-  bytes += (double) nmax * 3 * sizeof(double);
   return bytes;
-}
-
-/* ----------------------------------------------------------------------
-   allocate atom-based arrays
-------------------------------------------------------------------------- */
-
-void FixNHnew::grow_arrays(int nmax_new)
-{
-  const int nold = nmax;
-  nmax = nmax_new;
-  memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-
-  for (int i = nold; i < nmax; i++) {
-    v_backup[i][0] = v_backup[i][1] = v_backup[i][2] = 0.0;
-  }
-}
-
-/* ----------------------------------------------------------------------
-   copy atom-based arrays when atoms are sorted
-------------------------------------------------------------------------- */
-
-void FixNHnew::copy_arrays(int i, int j, int /*delflag*/)
-{
-  v_backup[j][0] = v_backup[i][0];
-  v_backup[j][1] = v_backup[i][1];
-  v_backup[j][2] = v_backup[i][2];
-}
-
-/* ----------------------------------------------------------------------
-   pack atom-based arrays for atom migration
-------------------------------------------------------------------------- */
-
-int FixNHnew::pack_exchange(int i, double *buf)
-{
-  buf[0] = v_backup[i][0];
-  buf[1] = v_backup[i][1];
-  buf[2] = v_backup[i][2];
-  return 3;
-}
-
-/* ----------------------------------------------------------------------
-   unpack atom-based arrays after atom migration
-------------------------------------------------------------------------- */
-
-int FixNHnew::unpack_exchange(int nlocal, double *buf)
-{
-  v_backup[nlocal][0] = buf[0];
-  v_backup[nlocal][1] = buf[1];
-  v_backup[nlocal][2] = buf[2];
-  return 3;
 }

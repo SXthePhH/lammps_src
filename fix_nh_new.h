@@ -42,10 +42,6 @@ class FixNHnew : public Fix {
   void reset_dt() override;
   void *extract(const char *, int &) override;
   double memory_usage() override;
-  void grow_arrays(int) override;
-  void copy_arrays(int, int, int) override;
-  int pack_exchange(int, double *) override;
-  int unpack_exchange(int, double *) override;
    void initial_integrate_middle(int);
    void final_integrate_middle();
 
@@ -88,10 +84,6 @@ class FixNHnew : public Fix {
   class Compute *temperature, *pressure;
   int tcomputeflag, pcomputeflag;    // 1 = compute was created by fix
                                      // 0 = created externally
-
-  char *id_temp_snapshot;
-  class Compute *temperature_snapshot;
-  int tsnapshotflag;
 
   double *eta, *eta_dot;    // chain thermostat for particles
   double *eta_dotdot;
@@ -147,8 +139,6 @@ class FixNHnew : public Fix {
   double omega_mass_corr, tau_baro;
   class RanMars *random;
   int seed;
-  double **v_backup;
-   int nmax;
 
   void couple();
   virtual void remap();
@@ -180,7 +170,6 @@ class FixNHnew : public Fix {
   void scale_v();
   void nhc_press_integrate_me();
   void nhc_press_integrate_iso();
-  void end_of_step();
   int nh_temp_flag, nh_press_flag;
   int big_mass_flag, big_omega_update_flag;
 };
