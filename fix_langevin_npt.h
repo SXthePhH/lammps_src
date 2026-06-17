@@ -72,6 +72,7 @@ class FixNPTLangevin : public Fix {
 
   class RanMars *random;
   int seed;
+  int zero_flag;
 
   // helpers
   double fast_sinhc(double x);

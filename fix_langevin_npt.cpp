@@ -98,6 +98,7 @@ FixNPTLangevin::FixNPTLangevin(LAMMPS *lmp, int narg, char **arg)
 
 
   seed = 123456789;
+  zero_flag = 1;
 
   // tilt scaling: default mirrors fix_nh (scale tilt with cell if periodic)
   scalexy = scaleyz = scalexz = 0;
@@ -233,6 +234,12 @@ FixNPTLangevin::FixNPTLangevin(LAMMPS *lmp, int narg, char **arg)
       if (iarg+1 >= narg)
         utils::missing_cmd_args(FLERR, fmt::format("fix {} seed", style), error);
       seed = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+      iarg += 2;
+
+    } else if (strcmp(arg[iarg], "zero") == 0) {
+      if (iarg+1 >= narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} zero", style), error);
+      zero_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
       iarg += 2;
 
     } else {
@@ -865,21 +872,54 @@ void FixNPTLangevin::langevin_temp()
   double *rmass= atom->rmass;
   double mvv2e = force->mvv2e;
   int nlocal   = atom->nlocal;
+  double fsum[4] = {0.0, 0.0, 0.0, 0.0};
+  double fsumall[4] = {0.0, 0.0, 0.0, 0.0};
 
   if (rmass) {
     for (int i = 0; i < nlocal; i++) {
       double inv_sqrt_m = 1.0 / sqrt(rmass[i] * mvv2e);
-      v[i][0] = lan_c1_t * v[i][0] + lan_c2_t * random->gaussian() * inv_sqrt_m;
-      v[i][1] = lan_c1_t * v[i][1] + lan_c2_t * random->gaussian() * inv_sqrt_m;
-      v[i][2] = lan_c1_t * v[i][2] + lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double fran0 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double fran1 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double fran2 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double mass_i = rmass[i];
+      if (zero_flag) {
+        fsum[0] += mass_i * fran0;
+        fsum[1] += mass_i * fran1;
+        fsum[2] += mass_i * fran2;
+        fsum[3] += mass_i;
+      }
+      v[i][0] = lan_c1_t * v[i][0] + fran0;
+      v[i][1] = lan_c1_t * v[i][1] + fran1;
+      v[i][2] = lan_c1_t * v[i][2] + fran2;
     }
   } else {
     for (int i = 0; i < nlocal; i++) {
-      double inv_sqrt_m = 1.0 / sqrt(mass[atom->type[i]] * mvv2e);
-      v[i][0] = lan_c1_t * v[i][0] + lan_c2_t * random->gaussian() * inv_sqrt_m;
-      // printf("term1: %f term2: %f\n", lan_c1_t * v[i][0], lan_c2_t * random->gaussian() * inv_sqrt_m);
-      v[i][1] = lan_c1_t * v[i][1] + lan_c2_t * random->gaussian() * inv_sqrt_m;
-      v[i][2] = lan_c1_t * v[i][2] + lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double mass_i = mass[atom->type[i]];
+      double inv_sqrt_m = 1.0 / sqrt(mass_i * mvv2e);
+      double fran0 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double fran1 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      double fran2 = lan_c2_t * random->gaussian() * inv_sqrt_m;
+      if (zero_flag) {
+        fsum[0] += mass_i * fran0;
+        fsum[1] += mass_i * fran1;
+        fsum[2] += mass_i * fran2;
+        fsum[3] += mass_i;
+      }
+      v[i][0] = lan_c1_t * v[i][0] + fran0;
+      v[i][1] = lan_c1_t * v[i][1] + fran1;
+      v[i][2] = lan_c1_t * v[i][2] + fran2;
+    }
+  }
+
+  if (zero_flag) {
+    MPI_Allreduce(fsum, fsumall, 4, MPI_DOUBLE, MPI_SUM, world);
+    double inv_tmass = 1.0 / fsumall[3];
+    double correction[3] = {fsumall[0] * inv_tmass, fsumall[1] * inv_tmass, fsumall[2] * inv_tmass};
+
+    for (int i = 0; i < nlocal; i++) {
+      v[i][0] -= correction[0];
+      v[i][1] -= correction[1];
+      v[i][2] -= correction[2];
     }
   }
 }
@@ -895,24 +935,24 @@ void FixNPTLangevin::langevin_press()
 
   if (comm->me == 0) {
     if (pcouple == COUPLE_XYZ) {
-      double kick = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[0]);
+      double kick = lan_c2_p * random->gaussian() / sqrt(omega_mass[0]);
       kicks[0] = kicks[1] = kicks[2] = kick;
     } else if (pcouple == COUPLE_XY) {
-      double kick = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[0]);
+      double kick = lan_c2_p * random->gaussian() / sqrt(omega_mass[0]);
       kicks[0] = kicks[1] = kick;
-      if (p_flag[2]) kicks[2] = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[2]);
+      if (p_flag[2]) kicks[2] = lan_c2_p * random->gaussian() / sqrt(omega_mass[2]);
     } else if (pcouple == COUPLE_YZ) {
-      double kick = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[1]);
+      double kick = lan_c2_p * random->gaussian() / sqrt(omega_mass[1]);
       kicks[1] = kicks[2] = kick;
-      if (p_flag[0]) kicks[0] = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[0]);
+      if (p_flag[0]) kicks[0] = lan_c2_p * random->gaussian() / sqrt(omega_mass[0]);
     } else if (pcouple == COUPLE_XZ) {
-      double kick = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[0]);
+      double kick = lan_c2_p * random->gaussian() / sqrt(omega_mass[0]);
       kicks[0] = kicks[2] = kick;
-      if (p_flag[1]) kicks[1] = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[1]);
+      if (p_flag[1]) kicks[1] = lan_c2_p * random->gaussian() / sqrt(omega_mass[1]);
     } else {
       for (int i = 0; i < 6; i++) {
         if (p_flag[i])
-          kicks[i] = lan_c2_p_2 * random->gaussian() / sqrt(omega_mass[i]);
+          kicks[i] = lan_c2_p * random->gaussian() / sqrt(omega_mass[i]);
       }
     }
   }
@@ -921,7 +961,7 @@ void FixNPTLangevin::langevin_press()
 
   for (int i = 0; i < 6; i++) {
     if (p_flag[i])
-      omega[i] = lan_c1_p_2 * omega[i] + kicks[i];
+      omega[i] = lan_c1_p * omega[i] + kicks[i];
   }
 }
 
@@ -959,23 +999,26 @@ double FixNPTLangevin::compute_temp_manual()
 
 void FixNPTLangevin::initial_integrate(int /*vflag*/)
 {
+  // B: half-step velocity update
+  scale_v();
+  update_v();
   // If we hacked the velocities at end_of_step (for thermo output to match t_initial),
   // we MUST restore them now before any physics happens!
-  if (v_stored) {
-    if (!v_storage) error->one(FLERR, "FixNPTLangevin: v_storage missing!");
+  // if (v_stored) {
+  //   if (!v_storage) error->one(FLERR, "FixNPTLangevin: v_storage missing!");
     
-    double **v = atom->v;
-    int nlocal = atom->nlocal;
-    for (int i = 0; i < nlocal; i++) {
-        v[i][0] = v_storage[i][0];
-        v[i][1] = v_storage[i][1];
-        v[i][2] = v_storage[i][2];
-    }
-    v_stored = 0;
+  //   double **v = atom->v;
+  //   int nlocal = atom->nlocal;
+  //   for (int i = 0; i < nlocal; i++) {
+  //       v[i][0] = v_storage[i][0];
+  //       v[i][1] = v_storage[i][1];
+  //       v[i][2] = v_storage[i][2];
+  //   }
+  //   v_stored = 0;
     
-    // Also clear the fake virial contribution we added for thermo
-    for (int k = 0; k < 6; k++) virial[k] = 0.0;
-  }
+  //   // Also clear the fake virial contribution we added for thermo
+  //   for (int k = 0; k < 6; k++) virial[k] = 0.0;
+  // }
 
   // B: half-step velocity update
   update_v();
@@ -1005,7 +1048,6 @@ void FixNPTLangevin::initial_integrate(int /*vflag*/)
 
   // O: Langevin kicks on particles and barostat
 
-  langevin_press();
   langevin_temp();
   langevin_press();
   // A: full-step position update (second half)
@@ -1032,78 +1074,76 @@ void FixNPTLangevin::final_integrate()
     pressure->addstep(update->ntimestep + 1);
   }
 
-  // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
-  // Only execute this when thermo output is active for this step
-  if (output->next_thermo == update->ntimestep) {
-    if (atom->nmax > nmax) {
-      nmax = atom->nmax;
-      // We reallocate both here since nmax tracks both
-      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
-      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-    }
+  // // Save the full velocity state v(t+dt/2) for later restoration at end_of_step
+  // // Only execute this when thermo output is active for this step
+  // if (output->next_thermo == update->ntimestep) {
+  //   if (atom->nmax > nmax) {
+  //     nmax = atom->nmax;
+  //     // We reallocate both here since nmax tracks both
+  //     memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
+  //     memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+  //   }
 
-    double **v = atom->v;
+    // double **v = atom->v;
 
-    int nlocal = atom->nlocal;
-    for (int i = 0; i < nlocal; i++) {
-        v_backup[i][0] = v[i][0];
-        v_backup[i][1] = v[i][1];
-        v_backup[i][2] = v[i][2];
-    }
-  }
+    // int nlocal = atom->nlocal;
+    // for (int i = 0; i < nlocal; i++) {
+    //     v_backup[i][0] = v[i][0];
+    //     v_backup[i][1] = v[i][1];
+    //     v_backup[i][2] = v[i][2];
+    // }
+  // }
   
   // half-step barostat omega update using fresh P
   update_omega();
-  // B: half-step velocity update
-  scale_v();
-  update_v();
+
 }
 
 /* ---------------------------------------------------------------------- */
 
 void FixNPTLangevin::end_of_step()
 {
-  // "Output Hack" Revised:
-  // To satisfy the requirement of recording correct "internal distribution" and "virial data"
-  // corresponding to the beginning of final_integrate, we physically restore the velocity state v(t+dt/2).
-  // 
-  // 1. Save current v(t+dt) to v_storage (to be restored in next initial_integrate).
-  // 2. Overwrite v with v_backup (v(t+dt/2)).
-  // 3. Do NOT modify virial manually; the position/force state is identical to start of final_integrate,
-  //    so ComputePressure will yield the correct virial contribution automatically.
+//   // "Output Hack" Revised:
+//   // To satisfy the requirement of recording correct "internal distribution" and "virial data"
+//   // corresponding to the beginning of final_integrate, we physically restore the velocity state v(t+dt/2).
+//   // 
+//   // 1. Save current v(t+dt) to v_storage (to be restored in next initial_integrate).
+//   // 2. Overwrite v with v_backup (v(t+dt/2)).
+//   // 3. Do NOT modify virial manually; the position/force state is identical to start of final_integrate,
+//   //    so ComputePressure will yield the correct virial contribution automatically.
   
-  if (output->next_thermo == update->ntimestep) {
-    if (atom->nmax > nmax) {
-      nmax = atom->nmax;
-      memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
-      memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
-    }
+//   if (output->next_thermo == update->ntimestep) {
+//     if (atom->nmax > nmax) {
+//       nmax = atom->nmax;
+//       memory->grow(v_storage, nmax, 3, "fix_npt:v_storage");
+//       memory->grow(v_backup, nmax, 3, "fix_npt:v_backup");
+//     }
   
-    double **v = atom->v;
-    int nlocal = atom->nlocal;
+//     double **v = atom->v;
+//     int nlocal = atom->nlocal;
   
-    // 1. Save valid v(t+dt)
-    for (int i=0; i<nlocal; i++) {
-        v_storage[i][0] = v[i][0];
-        v_storage[i][1] = v[i][1];
-        v_storage[i][2] = v[i][2];
-    }
-    v_stored = 1;
+//     // 1. Save valid v(t+dt)
+//     for (int i=0; i<nlocal; i++) {
+//         v_storage[i][0] = v[i][0];
+//         v_storage[i][1] = v[i][1];
+//         v_storage[i][2] = v[i][2];
+//     }
+//     v_stored = 1;
 
-    // 2. Restore v(t+dt/2)
-    if (v_backup) {
-        for (int i=0; i<nlocal; i++) {
-           v[i][0] = v_backup[i][0];
-           v[i][1] = v_backup[i][1];
-           v[i][2] = v_backup[i][2];
-        }
-    }
-  }
+//     // 2. Restore v(t+dt/2)
+//     if (v_backup) {
+//         for (int i=0; i<nlocal; i++) {
+//            v[i][0] = v_backup[i][0];
+//            v[i][1] = v_backup[i][1];
+//            v[i][2] = v_backup[i][2];
+//         }
+//     }
+//   }
 
-  // Force re-computation of Temperature/Pressure?
-  // Thermo will ask for these.
-  // If thermo uses a distinct compute, it will calculate from current v (which is now v_backup) -> Correct.
-  // If thermo uses fix's compute, it might use cached value from start of final_integrate -> Correct.
-  // We can force clear the cache to be safe, but LAMMPS API doesn't easily support "un-invoking".
-  // However, since we matched the state, the cached value is consistent with current state anyway.
+//   // Force re-computation of Temperature/Pressure?
+//   // Thermo will ask for these.
+//   // If thermo uses a distinct compute, it will calculate from current v (which is now v_backup) -> Correct.
+//   // If thermo uses fix's compute, it might use cached value from start of final_integrate -> Correct.
+//   // We can force clear the cache to be safe, but LAMMPS API doesn't easily support "un-invoking".
+//   // However, since we matched the state, the cached value is consistent with current state anyway.
 }
