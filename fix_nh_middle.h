@@ -49,20 +49,18 @@ class FixNHMiddle : public FixNH {
   void langevin_press();
   void nh_omega_dot_middle();
   void parse_middle_args(int, char **);
+  void apply_zero_dof_mode();
   void update_langevin_coefficients();
-  void update_middle_barostat_masses();
-
   double gamma_t, gamma_p, damp_t, damp_p;
   double lan_c1_t, lan_c2_t;
   double lan_c1_t_2, lan_c2_t_2;
   double lan_c1_p, lan_c2_p;
   double lan_c1_p_2, lan_c2_p_2;
-  double omega_mass_corr, tau_baro;
   class RanMars *random;
   int seed, zero_flag;
   int integrator;
   int nh_temp_flag, nh_press_flag;
-  int big_mass_flag, big_omega_update_flag;
+  int langevin_temp_damp_flag, langevin_press_damp_flag;
 };
 
 }    // namespace LAMMPS_NS

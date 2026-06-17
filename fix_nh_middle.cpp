@@ -29,7 +29,7 @@
 
 using namespace LAMMPS_NS;
 
-enum{SIDE, MIDDLE};
+enum{SIDE,  MIDDLE};
 enum{NONE,XYZ,XY,YZ,XZ};
 enum{ISO,ANISO,TRICLINIC};
 
@@ -42,16 +42,17 @@ FixNHMiddle::ArgList FixNHMiddle::filter_middle_args(int narg, char **arg)
 
   for (int i = 0; i < MIN(narg,3); i++) append(arg[i]);
 
+  // FixNH is the base Nose-Hoover parser.  It does not know the extra
+  // keywords added by this middle-scheme fix, so remove those keywords before
+  // calling the base constructor.
   int iarg = 3;
   while (iarg < narg) {
-    if (strcmp(arg[iarg],"thermostat") == 0 || strcmp(arg[iarg],"barostat") == 0 ||
-        strcmp(arg[iarg],"big_mass") == 0 || strcmp(arg[iarg],"big_update") == 0 ||
-        strcmp(arg[iarg],"seed") == 0 || strcmp(arg[iarg],"zero") == 0) {
+    if ((strcmp(arg[iarg],"thermostat") == 0 || strcmp(arg[iarg],"barostat") == 0) &&
+        iarg+2 < narg && utils::is_double(arg[iarg+2])) {
+      iarg += 3;
+    } else if (strcmp(arg[iarg],"thermostat") == 0 || strcmp(arg[iarg],"barostat") == 0 ||
+               strcmp(arg[iarg],"seed") == 0 || strcmp(arg[iarg],"zero") == 0) {
       iarg += 2;
-    } else if ((strcmp(arg[iarg],"iso") == 0 || strcmp(arg[iarg],"aniso") == 0 ||
-                strcmp(arg[iarg],"tri") == 0) && iarg+5 < narg) {
-      for (int j = 0; j < 4; j++) append(arg[iarg+j]);
-      iarg += 6;
     } else if (strcmp(arg[iarg],"integrator") == 0) {
       iarg += 2;
     } else {
@@ -75,8 +76,8 @@ FixNHMiddle::FixNHMiddle(LAMMPS *lmp, int narg, char **arg, ArgList &&filtered) 
   gamma_t(0.0), gamma_p(0.0), damp_t(0.0), damp_p(0.0),
   lan_c1_t(1.0), lan_c2_t(0.0), lan_c1_t_2(1.0), lan_c2_t_2(0.0),
   lan_c1_p(1.0), lan_c2_p(0.0), lan_c1_p_2(1.0), lan_c2_p_2(0.0),
-  omega_mass_corr(1.0), tau_baro(0.0), random(nullptr), seed(12345678), zero_flag(1),
-  integrator(MIDDLE), nh_temp_flag(0), nh_press_flag(0), big_mass_flag(0), big_omega_update_flag(0)
+  random(nullptr), seed(12345678), zero_flag(1), integrator(MIDDLE), nh_temp_flag(1),
+  nh_press_flag(1), langevin_temp_damp_flag(0), langevin_press_damp_flag(0)
 {
   parse_middle_args(narg,arg);
   if (damp_t > 0.0) gamma_t = 1.0 / damp_t;
@@ -95,13 +96,26 @@ FixNHMiddle::~FixNHMiddle()
 
 void FixNHMiddle::parse_middle_args(int narg, char **arg)
 {
+  // Parse only the keywords that are new or reinterpreted by FixNHMiddle.
+  // Standard FixNH keywords are still parsed by the base class constructor.
+  nh_temp_flag = 1;
+  nh_press_flag = 1;
   int iarg = 3;
   while (iarg < narg) {
     if (strcmp(arg[iarg],"thermostat") == 0) {
       if (iarg+2 > narg)
         utils::missing_cmd_args(FLERR, fmt::format("fix {} thermostat", style), error);
       if (strcmp(arg[iarg+1],"nh") == 0) nh_temp_flag = 1;
-      else if (strcmp(arg[iarg+1],"langevin") == 0) nh_temp_flag = 0;
+      else if (strcmp(arg[iarg+1],"langevin") == 0) {
+        if (iarg+3 > narg)
+          utils::missing_cmd_args(FLERR, fmt::format("fix {} thermostat langevin", style), error);
+        if (!utils::is_double(arg[iarg+2]))
+          error->all(FLERR, "Fix {} thermostat langevin requires a numeric relaxation time", style);
+        nh_temp_flag = 0;
+        langevin_temp_damp_flag = 1;
+        damp_t = utils::numeric(FLERR,arg[iarg+2],false,lmp);
+        iarg++;
+      }
       else error->all(FLERR, "Illegal fix {} thermostat option: {}", style, arg[iarg+1]);
       iarg += 2;
 
@@ -109,34 +123,23 @@ void FixNHMiddle::parse_middle_args(int narg, char **arg)
       if (iarg+2 > narg)
         utils::missing_cmd_args(FLERR, fmt::format("fix {} barostat", style), error);
       if (strcmp(arg[iarg+1],"nh") == 0) nh_press_flag = 1;
-      else if (strcmp(arg[iarg+1],"langevin") == 0) nh_press_flag = 0;
+      else if (strcmp(arg[iarg+1],"langevin") == 0) {
+        if (iarg+3 > narg)
+          utils::missing_cmd_args(FLERR, fmt::format("fix {} barostat langevin", style), error);
+        if (!utils::is_double(arg[iarg+2]))
+          error->all(FLERR, "Fix {} barostat langevin requires a numeric relaxation time", style);
+        nh_press_flag = 0;
+        langevin_press_damp_flag = 1;
+        damp_p = utils::numeric(FLERR,arg[iarg+2],false,lmp);
+        iarg++;
+      }
       else error->all(FLERR, "Illegal fix {} barostat option: {}", style, arg[iarg+1]);
       iarg += 2;
 
-    } else if (strcmp(arg[iarg],"big_mass") == 0) {
-      if (iarg+2 > narg)
-        utils::missing_cmd_args(FLERR, fmt::format("fix {} big_mass", style), error);
-      big_mass_flag = utils::logical(FLERR,arg[iarg+1],false,lmp);
-      iarg += 2;
-
-    } else if (strcmp(arg[iarg],"big_update") == 0) {
-      if (iarg+2 > narg)
-        utils::missing_cmd_args(FLERR, fmt::format("fix {} big_update", style), error);
-      big_omega_update_flag = utils::logical(FLERR,arg[iarg+1],false,lmp);
-      iarg += 2;
-
     } else if (strcmp(arg[iarg],"temp") == 0) {
-      damp_t = utils::numeric(FLERR,arg[iarg+3],false,lmp);
+      if (iarg+4 > narg)
+        utils::missing_cmd_args(FLERR, fmt::format("fix {} temp", style), error);
       iarg += 4;
-
-    } else if (strcmp(arg[iarg],"iso") == 0 || strcmp(arg[iarg],"aniso") == 0 ||
-               strcmp(arg[iarg],"tri") == 0) {
-      if (iarg+6 > narg)
-        utils::missing_cmd_args(FLERR, fmt::format("fix {} {}", style, arg[iarg]), error);
-      damp_p = utils::numeric(FLERR,arg[iarg+3],false,lmp);
-      tau_baro = utils::numeric(FLERR,arg[iarg+4],false,lmp);
-      omega_mass_corr = utils::numeric(FLERR,arg[iarg+5],false,lmp);
-      iarg += 6;
 
     } else if (strcmp(arg[iarg],"integrator") == 0) {
       if (iarg+2 > narg)
@@ -161,6 +164,8 @@ void FixNHMiddle::parse_middle_args(int narg, char **arg)
     } else if (strcmp(arg[iarg],"x") == 0 || strcmp(arg[iarg],"y") == 0 ||
                strcmp(arg[iarg],"z") == 0 || strcmp(arg[iarg],"xy") == 0 ||
                strcmp(arg[iarg],"xz") == 0 || strcmp(arg[iarg],"yz") == 0 ||
+               strcmp(arg[iarg],"iso") == 0 || strcmp(arg[iarg],"aniso") == 0 ||
+               strcmp(arg[iarg],"tri") == 0 ||
                strcmp(arg[iarg],"temp") == 0) {
       iarg += 4;
     } else if (strcmp(arg[iarg],"fixedpoint") == 0) {
@@ -191,6 +196,7 @@ void FixNHMiddle::parse_middle_args(int narg, char **arg)
 void FixNHMiddle::init()
 {
   FixNH::init();
+  apply_zero_dof_mode();
   update_langevin_coefficients();
 }
 
@@ -199,7 +205,7 @@ void FixNHMiddle::init()
 void FixNHMiddle::setup(int vflag)
 {
   FixNH::setup(vflag);
-  update_middle_barostat_masses();
+  apply_zero_dof_mode();
   update_langevin_coefficients();
 }
 
@@ -213,20 +219,21 @@ void FixNHMiddle::reset_dt()
 
 /* ---------------------------------------------------------------------- */
 
-void FixNHMiddle::update_middle_barostat_masses()
+void FixNHMiddle::apply_zero_dof_mode()
 {
-  if (!pstat_flag || tau_baro <= 0.0) return;
+  if (!temperature || nh_temp_flag) return;
 
-  double kt = boltz * t_target;
-  double nkt = big_mass_flag ? (3*atom->natoms + 1) * kt : (atom->natoms + 1) * kt;
-
-  for (int i = 0; i < 3; i++)
-    if (p_flag[i]) omega_mass[i] = nkt * tau_baro * tau_baro * omega_mass_corr;
-
-  if (pstyle == TRICLINIC) {
-    for (int i = 3; i < 6; i++)
-      if (p_flag[i]) omega_mass[i] = nkt * tau_baro * tau_baro * omega_mass_corr;
+  if (zero_flag) {
+    temperature->reset_extra_dof();
+    temperature->setup();
+    return;
   }
+
+  char *args[2];
+  args[0] = const_cast<char *>("extra/dof");
+  args[1] = const_cast<char *>("0");
+  temperature->modify_params(2, args);
+  temperature->setup();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -248,7 +255,8 @@ void FixNHMiddle::update_langevin_coefficients()
     gamma_p = 1.0 / damp_p;
     lan_c1_p = exp(-gamma_p * dt);
     lan_c1_p_2 = exp(-gamma_p * dt2);
-    double denom = (big_omega_update_flag == 0 && pstyle == ISO && pdim > 0) ? pdim : 1.0;
+
+    double denom = (pstyle == ISO && pdim > 0) ? pdim : 1.0;  // shared iso kick uses variance / pdim
     lan_c2_p = sqrt((1.0 - lan_c1_p * lan_c1_p) * boltz * t_target / denom);
     lan_c2_p_2 = sqrt((1.0 - lan_c1_p_2 * lan_c1_p_2) * boltz * t_target / denom);
   }
@@ -261,6 +269,8 @@ void FixNHMiddle::integrate_temp_thermostat()
   if (!tstat_flag) return;
   compute_temp_target();
   update_langevin_coefficients();
+
+  // nh_temp_flag selects Nose-Hoover chain; otherwise use the Langevin O-step.
   if (nh_temp_flag) nhc_temp_integrate();
   else langevin_temp();
 }
@@ -270,6 +280,9 @@ void FixNHMiddle::integrate_temp_thermostat()
 void FixNHMiddle::integrate_press_thermostat()
 {
   if (!pstat_flag || !mpchain) return;
+
+  // nh_press_flag selects Nose-Hoover chain; otherwise use the Langevin O-step
+  // on the barostat velocities.
   if (nh_press_flag) nhc_press_integrate();
   else langevin_press();
 }
@@ -352,6 +365,11 @@ void FixNHMiddle::initial_integrate(int /*vflag*/)
     return;
   }
 
+  // Middle ordering:
+  //   B: velocity/barostat half updates around the force kick
+  //   A: half position step
+  //   O: thermostat/barostat stochastic or NH chain step
+  //   A: second half position step
   if (pstat_flag) nh_v_press();
   nve_v();
   nve_v();
@@ -421,8 +439,8 @@ void FixNHMiddle::final_integrate()
 
 void FixNHMiddle::langevin_temp()
 {
-  double lan_coeff1 = (integrator == MIDDLE) ? lan_c1_t : lan_c1_t_2;
-  double lan_coeff2 = (integrator == MIDDLE) ? lan_c2_t : lan_c2_t_2;
+  double lan_coeff1 = (integrator == MIDDLE) ? lan_c1_t : lan_c1_t_2;  // full O-step for middle, half O-step for side
+  double lan_coeff2 = (integrator == MIDDLE) ? lan_c2_t : lan_c2_t_2;  // matching noise amplitude for the selected step size
   double **v = atom->v;
   double *mass = atom->mass;
   double *rmass = atom->rmass;
@@ -432,7 +450,7 @@ void FixNHMiddle::langevin_temp()
   double fsumall[4] = {0.0, 0.0, 0.0, 0.0};
 
   for (int i = 0; i < nlocal; i++) {
-    double mass_i = rmass ? rmass[i] : mass[atom->type[i]];
+    double mass_i = rmass ? rmass[i] : mass[atom->type[i]];  // prefer per-atom mass when available
     double inv_sqrt_m = 1.0 / sqrt(mass_i * mvv2e);
     double kick[3] = {lan_coeff2 * random->gaussian() * inv_sqrt_m,
                       lan_coeff2 * random->gaussian() * inv_sqrt_m,
@@ -451,6 +469,8 @@ void FixNHMiddle::langevin_temp()
   }
 
   if (zero_flag) {
+    // Remove the mass-weighted center-of-mass component of the random kick so
+    // the Langevin noise does not inject net linear momentum.
     MPI_Allreduce(fsum, fsumall, 4, MPI_DOUBLE, MPI_SUM, world);
     if (fsumall[3] > 0.0) {
       double correction[3] = {fsumall[0]/fsumall[3], fsumall[1]/fsumall[3], fsumall[2]/fsumall[3]};
@@ -469,11 +489,13 @@ void FixNHMiddle::langevin_temp()
 
 void FixNHMiddle::langevin_press()
 {
-  double lan_coeff1 = (integrator == MIDDLE) ? lan_c1_p : lan_c1_p_2;
-  double lan_coeff2 = (integrator == MIDDLE) ? lan_c2_p : lan_c2_p_2;
+  double lan_coeff1 = (integrator == MIDDLE) ? lan_c1_p : lan_c1_p_2;  // full O-step for middle, half O-step for side
+  double lan_coeff2 = (integrator == MIDDLE) ? lan_c2_p : lan_c2_p_2;  // matching noise amplitude for omega_dot
   double kicks[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
   if (comm->me == 0) {
+    // Coupled pressure dimensions share the same random kick so the coupled
+    // box lengths evolve consistently.
     if (pcouple == XYZ) {
       double kick = lan_coeff2 * random->gaussian() / sqrt(omega_mass[0]);
       kicks[0] = kicks[1] = kicks[2] = kick;
@@ -507,7 +529,7 @@ void FixNHMiddle::langevin_press()
 
 void FixNHMiddle::nh_omega_dot_middle()
 {
-  double volume = (dimension == 3) ? domain->xprd*domain->yprd*domain->zprd : domain->xprd*domain->yprd;
+  double volume = (dimension == 3) ? domain->xprd*domain->yprd*domain->zprd : domain->xprd*domain->yprd;  // 3d volume, 2d area
   if (deviatoric_flag) compute_deviatoric();
 
   mtk_term1 = 0.0;
@@ -517,7 +539,7 @@ void FixNHMiddle::nh_omega_dot_middle()
       double *mvv_current = temperature->vector;
       for (int i = 0; i < 3; i++)
         if (p_flag[i]) mtk_term1 += mvv_current[i];
-      mtk_term1 /= tdof;
+      mtk_term1 /= tdof;  // experimental
     }
   }
 
@@ -525,7 +547,6 @@ void FixNHMiddle::nh_omega_dot_middle()
     if (p_flag[i]) {
       double f_omega = (p_current[i]-p_hydro)*volume / (omega_mass[i] * nktv2p) + mtk_term1 / omega_mass[i];
       if (deviatoric_flag) f_omega -= fdev[i]/(omega_mass[i] * nktv2p);
-      if (big_omega_update_flag && pstyle == ISO) f_omega *= 3.0;
       omega_dot[i] += f_omega*dthalf;
       omega_dot[i] *= pdrag_factor;
     }
@@ -534,7 +555,7 @@ void FixNHMiddle::nh_omega_dot_middle()
   if (mtk_flag) {
     for (int i = 0; i < 3; i++)
       if (p_flag[i]) mtk_term2 += omega_dot[i];
-    if (tdof > 0.0) mtk_term2 /= tdof;
+    if (tdof > 0.0) mtk_term2 /= tdof;  // experimental
   }
 
   if (pstyle == TRICLINIC) {
