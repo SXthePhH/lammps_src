@@ -1,36 +1,81 @@
-This is a new version of LAMMPS with middle-scheme NPT/NVT integrator.
+# LAMMPS with the middle-scheme NPT/NVT/NPH integrator
 
-The core new features are implemented in the file fix_nh_new.cpp and fix_nh_new.h
+This is a LAMMPS fork that adds the **middle-scheme (BAOAB-type)**
+integrator as new fix styles, together with a SHAKE mode compatible with
+the middle splitting. The core implementation lives in
+`fix_nh_middle.cpp` / `fix_nh_middle.h`, exposed through three user
+entries:
 
-I have registered new fix style called fix npt/new, which is very similar to the original fix npt. More than that, you can choose the thermostat and barostat by adding keywords "barostat" and "thermostat" in fix command.
+- `fix nvt/mid` → `FixNVTMid`
+- `fix nph/mid` → `FixNPHMid`
+- `fix npt/mid` → `FixNPTMid`
 
-Now we support two types of thermostat and barostat, which are "langevin" and "nh". The default
-for both is `nh`.
+All three share the same core class `FixNHMiddle`.
 
-You can also choose to use different integration order by keywords "integrator", where you can choose "middle" or "side", and we recommand you to use middle integrator which is numerically more stable.
+## Documentation
 
-By default `zero 1` is used, which removes the COM momentum from the random Langevin kick. If you
-set `zero 0`, this fix also restores the temperature DOF so you do not need an extra
-`compute_modify ... extra/dof 0`.
+**`fix_nh_middle_manual.md`** — a full code-reader's manual for the
+implementation (Chinese). It covers:
 
-There are also some flags added, but might be removed afterwards. Which actually do not matter too much, just set them to be 0
+- **第零章** background: original `FixNH` / `fix nvt` / `fix nph` / `fix npt`
+  functionality, keywords and calling conventions; a guide on how to read
+  and modify `FixNH`-style integrators
+- **第一章** the 10 key code changes: thermostat/barostat type and
+  integration-order keywords, Langevin particle thermostat, Langevin box
+  barostat, the 1/d isotropic correction, MPI sync of the barostat random
+  term, the middle integration order, half-step position propagation, the
+  `update_omega_dot()` barostat half-step, COM-random-kick removal, and
+  the `zero_flag` / temperature-DOF coupling
+- **第二章** input-file syntax and calling rules (incl. anisotropic /
+  triclinic boxes, temperature-DOF handling, recommended templates)
+- **第三章** complete test examples (Argon `npt/mid` + Langevin, q-SPC/Fw
+  water)
+- **第四章** reference on the **position-constraint implementations in the
+  `RIGID` package** (`fix_shake` coordinate constraint in `middle` mode,
+  `fix_rattle` position/velocity projection, `fix_rigid` rigid-body
+  projection) for comparison with the middle scheme's C1/C2 constraints
 
+## Key features
 
-example:
-if you want to use the middle integrator with langevin thermo/barostat then the fix command should be 
+- **Integration order**: `integrator middle` (default recommended, more
+  stable) or `integrator side` (the traditional OBABO-style order).
+- **Thermostat / barostat types**: `nh` (default) or `langevin`, chosen
+  independently via the `thermostat` and `barostat` keywords. A Langevin
+  keyword takes one extra numeric argument: the relaxation time (fs).
+- **Constraints**: the modified `fix shake` supports `middle yes` —
+  coordinate (position) constraints only, applied in the middle-scheme
+  slot, without an end-of-step velocity projection. Put `fix shake` BEFORE
+  the `fix nvt/mid` / `fix npt/mid` command.
+- **COM handling**: `zero 1` (default) removes the COM momentum from the
+  random Langevin kick; `zero 0` restores the temperature DOF so no extra
+  `compute_modify ... extra/dof 0` is needed.
 
-fix 1 all npt/new iso (press args) temp (temp args) integrator middle \
-barostat langevin 1000.0 thermostat langevin 200.0
+## Quick examples
 
-The pressure keywords `iso`, `aniso`, `tri`, `x`, `y`, `z`, `xy`, `xz`, and `yz` keep the same
-argument format as the original `fix npt`.
+Middle NPT with Langevin thermostat + Langevin barostat:
 
-If you choose `thermostat langevin` or `barostat langevin`, you must append one extra
-numeric argument right after `langevin`. That value is the actual Langevin relaxation time used
-for the thermal bath or pressure bath.
+```lammps
+fix 1 all npt/mid iso (press args) temp (temp args) integrator middle \
+  barostat langevin 1000.0 thermostat langevin 200.0
+```
 
-New fix shake now has been added, if you want to run NPT wiith constrian, simply add a fix shake command BEFORE the fix npt/new
-and the fix shake command is different from the traditional ones, if you want to use shake compatible to middle integrator, you must add "middle yes" at the end of the fix command 
+The pressure keywords `iso`, `aniso`, `tri`, `x`, `y`, `z`, `xy`, `xz`,
+`yz` keep the same argument format as the original `fix npt`.
 
-example:
+Middle NPT with constraints (SHAKE, coordinate-only, middle-compatible):
+
+```lammps
 fix SHAKE all shake 1e-4 100 0 b 1 a 1 middle yes
+fix 1 all npt/mid iso (press args) temp (temp args) integrator middle \
+  thermostat nh barostat nh
+```
+
+NPH middle barostat only (no thermostat):
+
+```lammps
+fix 1 all nph/mid barostat langevin 200.0 iso 0.986923 0.986923 200.0 \
+  integrator middle
+```
+
+See `fix_nh_middle_manual.md` 第二章/第三章 for the full syntax and more
+examples.
