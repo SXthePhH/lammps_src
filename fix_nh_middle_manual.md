@@ -176,7 +176,7 @@ while (iarg < narg) {
 
 后文 `fix_nh_middle` 新增的关键字是：
 
-- `thermostat nh|langevin [Tdamp_lan]`：选择粒子温度热浴类型；`nh` 使用原版 Nose-Hoover chain，`langevin` 使用本文新增的粒子速度 Langevin O-step。**不写该关键字时默认 `langevin`，未显式给出 `Tdamp_lan` 时取默认 100.0 fs。**
+- `thermostat nh|langevin [Tdamp_lan]`：选择粒子温度热浴类型；`nh` 使用原版 Nose-Hoover chain，`langevin` 使用本文新增的粒子速度 Langevin O-step。**不写该关键字时默认 `langevin`，未显式给出 `Tdamp_lan` 时取默认 500.0 fs。**
 - `barostat nh|langevin [Pdamp_lan]`：选择 barostat 自由度的热浴类型；`nh` 使用原版压浴链，`langevin` 使用本文新增的盒子自由度 Langevin O-step。**不写该关键字时默认 `langevin`，未显式给出 `Pdamp_lan` 时取默认 1000.0 fs。**
 - `integrator side|middle`：选择时间分裂顺序；`side` 走接近原版 `FixNH` 的 side 顺序，`middle` 走本文新增的 middle 顺序。
 - `seed integer`：设置 Langevin 随机数种子，只在启用粒子或压浴 Langevin 时影响轨迹。
@@ -1780,7 +1780,7 @@ fix 1 all npt/mid temp 300.0 300.0 200.0 iso 1.0 1.0 1000.0
 
 对扩展关键字而言，默认值为：
 
-- `thermostat langevin`（未显式给出阻尼时间时为 100.0 fs）
+- `thermostat langevin`（未显式给出阻尼时间时为 500.0 fs）
 - `barostat langevin`（未显式给出阻尼时间时为 1000.0 fs）
 - `integrator middle`
 - `zero yes`

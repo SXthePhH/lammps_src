@@ -73,7 +73,7 @@ FixNHMiddle::FixNHMiddle(LAMMPS *lmp, int narg, char **arg) :
 
 FixNHMiddle::FixNHMiddle(LAMMPS *lmp, int narg, char **arg, ArgList &&filtered) :
   FixNH(lmp, static_cast<int>(filtered.argv.size()), filtered.argv.data()),
-  gamma_t(0.0), gamma_p(0.0), damp_t(100.0), damp_p(1000.0),
+  gamma_t(0.0), gamma_p(0.0), damp_t(500.0), damp_p(1000.0),
   lan_c1_t(1.0), lan_c2_t(0.0), lan_c1_t_2(1.0), lan_c2_t_2(0.0),
   lan_c1_p(1.0), lan_c2_p(0.0), lan_c1_p_2(1.0), lan_c2_p_2(0.0),
   random(nullptr), seed(12345678), zero_flag(1), integrator(MIDDLE), nh_temp_flag(0),
@@ -98,7 +98,7 @@ void FixNHMiddle::parse_middle_args(int narg, char **arg)
 {
   // Parse only the keywords that are new or reinterpreted by FixNHMiddle.
   // Standard FixNH keywords are still parsed by the base class constructor.
-  // Default thermostat/barostat: Langevin (damp_t = 100 fs, damp_p = 1000 fs,
+  // Default thermostat/barostat: Langevin (damp_t = 500 fs, damp_p = 1000 fs,
   // set in the constructor; override with `thermostat langevin <damp>` /
   // `barostat langevin <damp>`). Use `thermostat nh` / `barostat nh` for the
   // Nose-Hoover chain.

@@ -40,7 +40,7 @@ implementation (Chinese). It covers:
 - **Integration order**: `integrator middle` (default recommended, more
   stable) or `integrator side` (the traditional OBABO-style order).
 - **Thermostat / barostat types**: `langevin` (**default**; when no explicit
-  relaxation time is given, thermostat damp = 100 fs and barostat damp =
+  relaxation time is given, thermostat damp = 500 fs and barostat damp =
   1000 fs) or `nh`, chosen independently via the `thermostat` and `barostat`
   keywords. A Langevin keyword takes one extra numeric argument: the
   relaxation time (fs).
