@@ -176,8 +176,8 @@ while (iarg < narg) {
 
 后文 `fix_nh_middle` 新增的关键字是：
 
-- `thermostat nh|langevin [Tdamp_lan]`：选择粒子温度热浴类型；`nh` 使用原版 Nose-Hoover chain，`langevin` 使用本文新增的粒子速度 Langevin O-step。
-- `barostat nh|langevin [Pdamp_lan]`：选择 barostat 自由度的热浴类型；`nh` 使用原版压浴链，`langevin` 使用本文新增的盒子自由度 Langevin O-step。
+- `thermostat nh|langevin [Tdamp_lan]`：选择粒子温度热浴类型；`nh` 使用原版 Nose-Hoover chain，`langevin` 使用本文新增的粒子速度 Langevin O-step。**不写该关键字时默认 `langevin`，未显式给出 `Tdamp_lan` 时取默认 100.0 fs。**
+- `barostat nh|langevin [Pdamp_lan]`：选择 barostat 自由度的热浴类型；`nh` 使用原版压浴链，`langevin` 使用本文新增的盒子自由度 Langevin O-step。**不写该关键字时默认 `langevin`，未显式给出 `Pdamp_lan` 时取默认 1000.0 fs。**
 - `integrator side|middle`：选择时间分裂顺序；`side` 走接近原版 `FixNH` 的 side 顺序，`middle` 走本文新增的 middle 顺序。
 - `seed integer`：设置 Langevin 随机数种子，只在启用粒子或压浴 Langevin 时影响轨迹。
 - `zero yes/no`：控制粒子 Langevin 随机 kick 是否去除质心净冲量；在 `thermostat langevin` 路径下还联动内部温度 compute 的 `extra/dof` 设置。
@@ -1780,8 +1780,8 @@ fix 1 all npt/mid temp 300.0 300.0 200.0 iso 1.0 1.0 1000.0
 
 对扩展关键字而言，默认值为：
 
-- `thermostat nh`
-- `barostat nh`
+- `thermostat langevin`（未显式给出阻尼时间时为 100.0 fs）
+- `barostat langevin`（未显式给出阻尼时间时为 1000.0 fs）
 - `integrator middle`
 - `zero yes`
 
@@ -1925,7 +1925,7 @@ temperature->setup();
 
 - `zero yes` 时，保留当前温度 compute 的默认 `extra/dof` 设置
 - `zero no` 时，自动执行与 `compute_modify ... extra/dof 0` 等价的处理
-- 该自动处理不适用于默认的 `thermostat nh` 路径
+- 该自动处理适用于 Langevin 温度热浴（现在为默认路径）；显式使用 `thermostat nh` 时不需要（也不适用）该处理
 
 ### 2.9 推荐的输入模板
 

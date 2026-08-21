@@ -73,11 +73,11 @@ FixNHMiddle::FixNHMiddle(LAMMPS *lmp, int narg, char **arg) :
 
 FixNHMiddle::FixNHMiddle(LAMMPS *lmp, int narg, char **arg, ArgList &&filtered) :
   FixNH(lmp, static_cast<int>(filtered.argv.size()), filtered.argv.data()),
-  gamma_t(0.0), gamma_p(0.0), damp_t(0.0), damp_p(0.0),
+  gamma_t(0.0), gamma_p(0.0), damp_t(100.0), damp_p(1000.0),
   lan_c1_t(1.0), lan_c2_t(0.0), lan_c1_t_2(1.0), lan_c2_t_2(0.0),
   lan_c1_p(1.0), lan_c2_p(0.0), lan_c1_p_2(1.0), lan_c2_p_2(0.0),
-  random(nullptr), seed(12345678), zero_flag(1), integrator(MIDDLE), nh_temp_flag(1),
-  nh_press_flag(1), langevin_temp_damp_flag(0), langevin_press_damp_flag(0)
+  random(nullptr), seed(12345678), zero_flag(1), integrator(MIDDLE), nh_temp_flag(0),
+  nh_press_flag(0), langevin_temp_damp_flag(1), langevin_press_damp_flag(1)
 {
   parse_middle_args(narg,arg);
   if (damp_t > 0.0) gamma_t = 1.0 / damp_t;
@@ -98,8 +98,14 @@ void FixNHMiddle::parse_middle_args(int narg, char **arg)
 {
   // Parse only the keywords that are new or reinterpreted by FixNHMiddle.
   // Standard FixNH keywords are still parsed by the base class constructor.
-  nh_temp_flag = 1;
-  nh_press_flag = 1;
+  // Default thermostat/barostat: Langevin (damp_t = 100 fs, damp_p = 1000 fs,
+  // set in the constructor; override with `thermostat langevin <damp>` /
+  // `barostat langevin <damp>`). Use `thermostat nh` / `barostat nh` for the
+  // Nose-Hoover chain.
+  nh_temp_flag = 0;
+  nh_press_flag = 0;
+  langevin_temp_damp_flag = 1;
+  langevin_press_damp_flag = 1;
   int iarg = 3;
   while (iarg < narg) {
     if (strcmp(arg[iarg],"thermostat") == 0) {
